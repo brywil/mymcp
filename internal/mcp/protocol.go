@@ -122,12 +122,4 @@ type CallToolResult struct {
 type ToolProvider interface {
 	ListTools() []ToolDef
 	CallTool(ctx context.Context, name string, args map[string]interface{}) (text string, isError bool)
-	ReadOnly(name string) bool
-}
-
-// Authorizer decides, per client-certificate CN, whether a principal is known
-// and whether it may call a given tool. Implemented by policy.Enforcer.
-type Authorizer interface {
-	Known(cn string) bool
-	Allow(cn, tool string, readOnly bool) bool
 }

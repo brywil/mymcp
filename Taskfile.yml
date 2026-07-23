@@ -118,7 +118,7 @@ tasks:
       # systemd env files don't expand ~/$HOME. Create the workspace too.
       - |
         if [ ! -f {{.CFG_DIR}}/mymcp.env ]; then
-          printf 'ADDR=0.0.0.0:9443\nWORKSPACE=%s/mymcp-workspace\n' "$HOME" > {{.CFG_DIR}}/mymcp.env
+          printf 'ADDR=127.0.0.1:9443\nWORKSPACE=%s/mymcp-workspace\n' "$HOME" > {{.CFG_DIR}}/mymcp.env
         fi
       - mkdir -p "$HOME/mymcp-workspace"
       - loginctl enable-linger "$USER" || true

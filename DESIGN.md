@@ -1,119 +1,76 @@
 # mymcp — design
 
-A small, self-contained MCP server that exposes host tools (file I/O, exec, git,
-http, …) to any MCP-speaking agent, with mandatory mTLS, a hand-manageable
-directory trust model, and per-principal capability control. Pure Go stdlib, no
-dependencies.
+A small, self-contained **local MCP tool server**: it exposes host tools to any
+MCP client over plain HTTP on loopback, gated by named bearer tokens. Pure Go
+stdlib, no dependencies.
 
-## Components (one binary, subcommands)
+## Scope (and non-scope)
 
-- `mymcp serve` — the tool server. Streamable-HTTP MCP over **mandatory mTLS**.
-- `mymcp connect` — client-side sidecar: listens on localhost plain HTTP,
-  originates mTLS upstream (holds the client cert). Lets clients that can't do
-  mTLS (most MCP clients, incl. the llama.cpp web UI) connect with zero mTLS
-  support. Hardware-token (PKCS#11) cert source is an optional build-tagged
-  extension; software PEM certs are the stdlib default.
-- `mymcp trust` — manage trusted authorities / pins / pending, out of band.
-- `mymcp principal` — manage the capability database (who can call what).
-- `mymcp certs` — optional PKI generator for users without an existing CA.
+mymcp is **local-only** by design. It binds `127.0.0.1` and refuses a
+non-loopback bind unless `--allow-remote` is passed. Network-level security
+(TLS, mutual TLS, LAN exposure) is intentionally **not** mymcp's job — for that,
+keep mymcp on loopback and put [`truemtls`](https://github.com/brywil/truemtls)
+in front:
+
+```
+MCP client ──Bearer token──► truemtls (mandatory mTLS) ──► mymcp (loopback)
+```
+
+This is why an earlier mTLS-in-mymcp design was dropped: browser MCP clients
+(e.g. the llama.cpp web UI) can't present client certificates, but they *can*
+send an `Authorization` header — so a bearer token is the auth that actually
+works across clients, and mTLS is layered on by truemtls only when needed.
 
 ## Transport
 
-MCP Streamable HTTP: JSON-RPC 2.0 POSTed to `/mcp`, answered `application/json`.
-The server sets permissive CORS so a browser MCP client connects **directly** —
-the llama.cpp `--webui-mcp-proxy` stays **off**, sidestepping its auth-header
-bugs (#21012, #21167).
+MCP Streamable HTTP: JSON-RPC 2.0 POSTed to `/mcp` (also `/`), answered
+`application/json`. Handles `initialize`, `tools/list`, `tools/call`, `ping`,
+and ignores notifications. Sets permissive CORS and answers OPTIONS preflight so
+browser MCP clients work.
 
-## Identity model: authenticate by CA, authorize by CN
-
-- **Authentication (who signed you): mTLS.** `crypto/tls` with
-  `ClientAuth: RequireAnyClientCert` + a custom `VerifyPeerCertificate`. A client
-  cert is authenticated iff it is a pinned leaf, or it chains to a CA in
-  `authorities/`. An org may have **several** CAs (CAC/PIV rotation, multiple
-  issuers) — all are equal authentication anchors.
-- **Authorization (what you may do): by CN principal.** The client cert's
-  Subject **CommonName** is the principal. Authorization is keyed on the CN and
-  is **independent of which CA issued the cert**, so re-issuing a user's token
-  under a different org CA needs no re-registration. A principal must exist in
-  the capability database and the specific tool must be in its allow-set.
-
-> Trust assumption: because a CN is honored regardless of issuing CA, only
-> **org-controlled** CAs belong in `authorities/` — any of them can assert a CN.
-
-## Trust store — a directory tree (authentication)
+## Authentication: named bearer tokens
 
 ```
-<trust-root>/                 # e.g. ~/.config/mymcp/trust
-  authorities/                # trusted CA certs (one PEM per CA)
-  pinned/                     # exact leaf certs (self-authenticating, no CA)
-  pending/                    # unknown certs captured at handshake, awaiting approval
+~/.config/mymcp/tokens/
+  default          # file, 0600, contents = the secret token
+  alice
+  build-agent
 ```
 
-Trust a CA = drop its PEM in `authorities/`; revoke = delete it. On an unknown
-cert the handshake is rejected and the chain written to `pending/`. Approve:
+- **Multiple tokens**, one file per name — hand-manageable, no database.
+- **Issue:** `mymcp token add <name>` (or `mymcp token` for "default").
+- **Revoke:** delete the file, or `mymcp token revoke <name>` — effective on the
+  next request (the directory is re-read each time).
+- **Authenticate:** the presented `Bearer` token is compared (constant-time)
+  against every stored token; a match yields the token's **name** as the
+  principal. Deny → `401`.
+- **Logging:** every `tools/call` is logged as `principal=<name> tool=<name>`,
+  so per-client attribution is in the server log.
+- `--no-auth` disables the check (open; only sane on loopback).
 
-- `mymcp trust approve authority <fp>` — trust the issuing CA (adds to `authorities/`).
-- `mymcp trust pin <fp>` — exact-leaf trust (adds to `pinned/`), for ad-hoc/no-CA clients.
-- `mymcp trust list` / `revoke` — inspect / remove.
-
-## Capability database — per principal (authorization)
-
-```
-<config>/principals/          # e.g. ~/.config/mymcp/principals
-  <slug>.principal            # one file per principal
-```
-
-Each `.principal` file (hand-editable):
-
-```
-cn = Alice Example            # exact CN to match (may contain spaces)
-allow = read_file, list_directory, path_info, git_status
-# allow = *                   # all tools
-```
-
-Enforcement:
-
-- On connect, the peer CN must resolve to a known principal, else `403` (and the
-  attempt is logged for registration).
-- On `tools/call`, the tool name must be in that principal's allow-set (or `*`).
-
-CLI: `mymcp principal add "<cn>" --allow read_file,list_directory`,
-`mymcp principal list`, `mymcp principal allow "<cn>" run_command`,
-`mymcp principal rm "<cn>"`. Registering from a pending cert:
-`mymcp principal add-pending <fp> --allow …` (reads the CN from the queued cert).
-
-Default is **deny**: a brand-new principal with no `allow` entries can call
-nothing until granted.
+serve auto-creates a `default` token on first run if the store is empty, so it's
+never unintentionally open.
 
 ## Tools
 
-Full host tool set, each call gated by the principal's allow-set: filesystem
-(confined to a `--workspace` root), `run_command`, git, http fetch, system info.
-An allowed principal with `run_command`/write tools effectively has RCE — which
-is why authn is mandatory and authz is deny-by-default and per-tool.
+Registered at boot into a workspace-confined registry: filesystem (read/write/
+list/edit/…, confined to `--workspace`), `run_command`, git, http fetch, system
+info. `tools/list` advertises them; `tools/call` dispatches.
 
-## Factoring: standalone mTLS gate (planned)
+> An allowed caller with `run_command`/write tools effectively has remote code
+> execution — that is the intended power of the tool. The guardrails are the
+> loopback bind, the workspace confinement for file tools, and the bearer token
+> (plus truemtls in front for anything off-box).
 
-The trust/policy/pki core + CLI verbs are independent of MCP and are the reusable
-asset — they remove most of the pain of server-side mTLS administration. Plan to
-extract them into their own module (`truemtls` — mutual TLS done properly, minus
-the operational tax), exposed as:
+## Packages
 
-1. a **Go library** any server imports (install the store's `Verify` as
-   `tls.Config.VerifyPeerCertificate`, reuse the `trust`/`allow`/`principal` CLIs);
-2. a **standalone reverse-proxy** (`truemtls serve --backend http://…`) that fronts
-   any HTTP service and adds mTLS + directory trust + TOFU + CN authz with zero
-   backend changes.
+- `internal/mcp` — protocol + HTTP server (transport, CORS, bearer gate, dispatch).
+- `internal/tokens` — the directory-backed named-token store.
+- `internal/tools` — the tool catalog + workspace-confined registry.
+- `cmd/mymcp` — the `serve` and `token` commands.
 
-`mymcp` becomes the first consumer; `mymcp connect` is the client-side counterpart.
+## Deploy
 
-## Install (`install.sh`) — XDG + user service
-
-No root. Binary → `~/.local/bin/mymcp`. Trust root →
-`~/.config/mymcp/trust/{authorities,pinned,pending}`. Principals →
-`~/.config/mymcp/principals/`. Server identity → `~/.config/mymcp/server.{crt,key}`
-(self-signed if absent). Config → `~/.config/mymcp/config.env`. State/logs →
-`~/.local/state/mymcp/`. **User systemd unit** →
-`~/.config/systemd/user/mymcp.service`, `systemctl --user enable --now mymcp`
-(+ `loginctl enable-linger` to survive logout). `--purge` also removes the trust
-root and principals.
+Per-user, no root: `~/.local/bin/mymcp`, a `systemd --user` unit, config/tokens
+in `~/.config/mymcp/`. See the Taskfile (`build`/`test`/`deploy`/`install-unit`)
+and README.

@@ -9,16 +9,18 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 )
 
-// Options configures a Server. Authentication is enforced at the TLS layer
-// (mandatory mTLS + trust store); Authz enforces per-CN capability policy.
+// Options configures a Server. If Authenticate is non-nil, every /mcp request
+// must carry "Authorization: Bearer <token>" that it accepts; it returns a
+// principal name used for logging. Nil Authenticate = open (loopback use).
 type Options struct {
-	Tools      ToolProvider
-	Authz      Authorizer
-	ServerName string
-	Version    string
-	Logger     *log.Logger
+	Tools        ToolProvider
+	Authenticate func(bearer string) (principal string, ok bool)
+	ServerName   string
+	Version      string
+	Logger       *log.Logger
 }
 
 // Server is an HTTP handler implementing MCP over Streamable HTTP.
@@ -47,10 +49,30 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, `{"status":"ok"}`)
 	case "/mcp", "/":
-		s.handleMCP(w, r)
+		principal := "-"
+		if s.o.Authenticate != nil {
+			p, ok := s.o.Authenticate(bearerToken(r))
+			if !ok {
+				s.o.Logger.Printf("DENIED unauthorized request from %s", r.RemoteAddr)
+				w.Header().Set("WWW-Authenticate", `Bearer realm="mymcp"`)
+				http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+				return
+			}
+			principal = p
+		}
+		s.handleMCP(w, r, principal)
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func bearerToken(r *http.Request) string {
+	const prefix = "Bearer "
+	h := r.Header.Get("Authorization")
+	if strings.HasPrefix(h, prefix) {
+		return strings.TrimSpace(h[len(prefix):])
+	}
+	return ""
 }
 
 func setCORS(w http.ResponseWriter, r *http.Request) {
@@ -67,15 +89,7 @@ func setCORS(w http.ResponseWriter, r *http.Request) {
 	h.Set("Access-Control-Max-Age", "86400")
 }
 
-// clientCN returns the peer certificate's Subject CommonName (the principal).
-func clientCN(r *http.Request) string {
-	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
-		return r.TLS.PeerCertificates[0].Subject.CommonName
-	}
-	return ""
-}
-
-func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request, principal string) {
 	switch r.Method {
 	case http.MethodDelete:
 		w.WriteHeader(http.StatusOK)
@@ -86,13 +100,6 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	cn := clientCN(r)
-	if s.o.Authz != nil && !s.o.Authz.Known(cn) {
-		s.o.Logger.Printf("DENIED unknown principal cn=%q — register with: mymcp allow %q ro", cn, cn)
-		http.Error(w, `{"error":"unknown principal"}`, http.StatusForbidden)
 		return
 	}
 
@@ -122,7 +129,7 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 	var resps []Response
 	sessionSet := false
 	for _, req := range reqs {
-		resp, isInit := s.process(r.Context(), req, cn)
+		resp, isInit := s.process(r.Context(), req, principal)
 		if isInit && !sessionSet {
 			w.Header().Set("Mcp-Session-Id", newSessionID())
 			sessionSet = true
@@ -149,15 +156,7 @@ func writeSingle(w http.ResponseWriter, resp *Response) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// allowed reports whether principal cn may use the named tool.
-func (s *Server) allowed(cn, tool string) bool {
-	if s.o.Authz == nil {
-		return true
-	}
-	return s.o.Authz.Allow(cn, tool, s.o.Tools.ReadOnly(tool))
-}
-
-func (s *Server) process(ctx context.Context, req Request, cn string) (resp *Response, isInit bool) {
+func (s *Server) process(ctx context.Context, req Request, principal string) (resp *Response, isInit bool) {
 	switch req.Method {
 	case "initialize":
 		pv := DefaultProtocolVersion
@@ -175,25 +174,13 @@ func (s *Server) process(ctx context.Context, req Request, cn string) (resp *Res
 	case "ping":
 		return okResponse(req.ID, struct{}{}), false
 	case "tools/list":
-		all := s.o.Tools.ListTools()
-		visible := make([]ToolDef, 0, len(all))
-		for _, t := range all {
-			if s.allowed(cn, t.Name) {
-				visible = append(visible, t) // only advertise what this principal may call
-			}
-		}
-		return okResponse(req.ID, ToolsListResult{Tools: visible}), false
+		return okResponse(req.ID, ToolsListResult{Tools: s.o.Tools.ListTools()}), false
 	case "tools/call":
 		var p callToolParams
 		if err := json.Unmarshal(req.Params, &p); err != nil {
 			return errResponse(req.ID, CodeInvalidParams, "invalid params"), false
 		}
-		if !s.allowed(cn, p.Name) {
-			return okResponse(req.ID, CallToolResult{
-				Content: []ToolContent{{Type: "text", Text: "not authorized: principal " + cn + " may not call " + p.Name}},
-				IsError: true,
-			}), false
-		}
+		s.o.Logger.Printf("call principal=%q tool=%s", principal, p.Name) // audit log
 		text, isErr := s.o.Tools.CallTool(ctx, p.Name, p.Arguments)
 		return okResponse(req.ID, CallToolResult{
 			Content: []ToolContent{{Type: "text", Text: text}},

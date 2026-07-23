@@ -1,9 +1,10 @@
 # systemd --user unit for mymcp (no sudo).
 # Install:   task install-unit   (copies this to ~/.config/systemd/user/)
-# Configure: edit ~/.config/mymcp/mymcp.env  (WORKSPACE, ADDR)
+# Configure: edit ~/.config/mymcp/mymcp.env  (ADDR, WORKSPACE)
+# Token:     mymcp token          (prints the bearer token for your MCP client)
 # Start:     systemctl --user start mymcp
 [Unit]
-Description=mymcp — MCP tool server (mandatory mTLS, per-CN capabilities)
+Description=mymcp — local MCP tool server (bearer-token auth)
 Documentation=https://github.com/brywil/mymcp
 After=network-online.target
 Wants=network-online.target
@@ -11,14 +12,15 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=%h/.config/mymcp/mymcp.env
-ExecStart=%h/.local/bin/mymcp serve --config-dir %h/.config/mymcp --addr ${ADDR} --workspace ${WORKSPACE}
+# Bearer token is auto-managed at ~/.config/mymcp/token (retrieve: mymcp token).
+ExecStart=%h/.local/bin/mymcp serve --addr ${ADDR} --workspace ${WORKSPACE}
 Restart=on-failure
 RestartSec=2
 
-# Modest hardening only: mymcp's run_command is remote code execution by design,
-# so heavy filesystem sandboxing would fight its purpose. The real protection is
-# mandatory mTLS + deny-by-default per-CN capabilities. We still keep the system
-# read-only and give it a private /tmp.
+# Modest hardening only: run_command is remote code execution by design, so
+# heavy filesystem sandboxing would fight its purpose. The protection is the
+# loopback bind + bearer token (and truemtls in front for LAN). System stays
+# read-only; private /tmp.
 NoNewPrivileges=true
 ProtectSystem=strict
 ReadWritePaths=%h
