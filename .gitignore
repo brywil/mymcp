@@ -1,0 +1,16 @@
+# build artifacts (anchored to repo root so it never matches cmd/mymcp/)
+/build/
+/mymcp
+*.test
+coverage.out
+coverage.html
+
+# local certs / keys / trust material — never commit
+*.pem
+*.key
+*.crt
+*.p12
+
+# editor / OS
+.DS_Store
+*.swp
