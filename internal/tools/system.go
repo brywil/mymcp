@@ -798,15 +798,9 @@ func (m *miscTools) register(r *Registry) {
 		ReadOnly:    true,
 		Handler:     m.systemStatus,
 	})
-	r.Register(&Tool{
-		Name:        "sleep",
-		Description: "Pause execution for a number of seconds (0.1–300).",
-		Schema:      obj(map[string]interface{}{"seconds": map[string]interface{}{"type": "number", "description": "Seconds to sleep (min 0.1, max 300)"}}, "seconds"),
-		ReadOnly:    true,
-		Handler:     m.sleep,
-	})
-	// model_info intentionally lives in goclaw, not here: it must follow goclaw's
-	// runtime /model backend switches, and only goclaw knows the active backend.
+	// sleep and model_info intentionally live in goclaw, not here: sleep drives a
+	// Telegram countdown, and model_info must follow goclaw's runtime /model
+	// backend switches. Keeping single implementations avoids drift.
 }
 
 func localESTNow() time.Time {
@@ -891,26 +885,6 @@ func humanizeTime(t time.Time) string {
 	}
 }
 
-func (m *miscTools) sleep(_ context.Context, args map[string]interface{}) (string, error) {
-	v, ok := args["seconds"]
-	if !ok {
-		return "", errors.New("missing required argument: seconds")
-	}
-	seconds, ok := v.(float64)
-	if !ok {
-		return "", fmt.Errorf("seconds must be a number, got %T", v)
-	}
-	if seconds < 0.1 {
-		seconds = 0.1
-	}
-	if seconds > 300 {
-		seconds = 300
-	}
-	start := time.Now()
-	time.Sleep(time.Duration(seconds*1000) * time.Millisecond)
-	elapsed := time.Since(start)
-	return fmt.Sprintf("Slept for %.1f seconds (requested: %.1f)", elapsed.Seconds(), seconds), nil
-}
 
 // -----------------------------------------------------------------------------
 // memoryTools: search/list of the workspace memory files.
