@@ -75,7 +75,9 @@ func (r *Registry) CallTool(ctx context.Context, name string, args map[string]in
 	}
 	out, err := t.Handler(ctx, args)
 	if err != nil {
-		return "error: " + err.Error(), true
+		// The isError flag already marks this a failure; no "error:" prefix so
+		// clients don't render a doubled "Error: error:".
+		return err.Error(), true
 	}
 	return out, false
 }

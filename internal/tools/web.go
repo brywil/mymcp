@@ -2,66 +2,1629 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
+
+	nethtml "golang.org/x/net/html"
 )
 
-const maxBodyBytes = 512 << 10 // 512 KiB response cap
+// =============================================================================
+// httpTools: raw HTTP client + content parsers (http_request, parse_html,
+// parse_json, parse_css). Ported from goclaw internal/tools/http_tool.go.
+// =============================================================================
 
-// webTools provides outbound HTTP fetches.
-type webTools struct{ timeout time.Duration }
+// httpTools provides a raw HTTP client and HTML/JSON/CSS parsers.
+type httpTools struct {
+	timeout      time.Duration // request timeout (goclaw default 30s)
+	allowedHosts []string      // if non-nil, restricts requests to these hosts
+	client       *http.Client
+}
 
-func (wt *webTools) register(r *Registry) {
+func (ht *httpTools) register(r *Registry) {
+	if ht.client == nil {
+		ht.client = &http.Client{
+			Timeout: ht.timeout,
+			Transport: &http.Transport{
+				MaxIdleConns:        10,
+				MaxIdleConnsPerHost: 5,
+				IdleConnTimeout:     90 * time.Second,
+			},
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
+	}
+	// http_request is NOT read-only: it can POST/PUT/DELETE.
 	r.Register(&Tool{
-		Name:        "http_fetch",
-		Description: "Perform an HTTP request and return status, headers, and (truncated) body.",
-		Schema: obj(map[string]interface{}{
-			"url":    strProp("Absolute URL"),
-			"method": strProp("HTTP method (default GET)"),
-			"body":   strProp("Optional request body"),
-		}, "url"),
-		// Not marked read-only: an HTTP request can have side effects, so it is
-		// excluded from the "ro" preset and must be granted explicitly.
-		Handler: wt.fetch,
+		Name:        "http_request",
+		Description: "Send a raw HTTP request (any method, headers, body) and return status, headers, and body.",
+		Schema:      httpRequestSchema,
+		ReadOnly:    false,
+		Handler:     ht.httpRequest,
+	})
+	r.Register(&Tool{
+		Name:        "parse_html",
+		Description: "Fetch or accept HTML and extract text, headings, links, meta, or structure.",
+		Schema:      parseHTMLSchema,
+		ReadOnly:    true,
+		Handler:     ht.parseHTML,
+	})
+	r.Register(&Tool{
+		Name:        "parse_json",
+		Description: "Fetch or accept JSON, describe its structure, format it, or extract dot-notation paths.",
+		Schema:      parseJSONSchema,
+		ReadOnly:    true,
+		Handler:     ht.parseJSON,
+	})
+	r.Register(&Tool{
+		Name:        "parse_css",
+		Description: "Fetch or accept HTML and extract elements matching a CSS selector.",
+		Schema:      parseCSSSchema,
+		ReadOnly:    true,
+		Handler:     ht.parseCSS,
 	})
 }
 
-func (wt *webTools) fetch(ctx context.Context, a map[string]interface{}) (string, error) {
-	url := argString(a, "url")
-	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
-		return "", fmt.Errorf("url must be absolute http(s)")
+var httpRequestSchema = map[string]interface{}{
+	"type": "object",
+	"properties": map[string]interface{}{
+		"url": map[string]interface{}{
+			"type":        "string",
+			"description": "The URL to send the request to (http:// or https://)",
+		},
+		"method": map[string]interface{}{
+			"type":        "string",
+			"description": "HTTP method: GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS. Default: GET",
+		},
+		"body": map[string]interface{}{
+			"type":        "string",
+			"description": "Request body (for POST, PUT, PATCH). JSON-encoded if content_type is application/json.",
+		},
+		"headers": map[string]interface{}{
+			"type":        "object",
+			"description": "Additional HTTP headers as key-value pairs.",
+			"additionalProperties": map[string]interface{}{
+				"type": "string",
+			},
+		},
+		"content_type": map[string]interface{}{
+			"type":        "string",
+			"description": "Content-Type header value. Common values: application/json, text/html, text/plain, multipart/form-data. If omitted, inferred from body.",
+		},
+		"follow_redirects": map[string]interface{}{
+			"type":        "boolean",
+			"description": "Whether to follow redirects. Default: false (returns the redirect response itself).",
+		},
+		"max_response_size": map[string]interface{}{
+			"type":        "integer",
+			"description": "Maximum response body size in bytes to read. Default: 1048576 (1MB). Set to 0 for unlimited.",
+		},
+	},
+	"required": []string{"url"},
+}
+
+func (ht *httpTools) httpRequest(ctx context.Context, args map[string]interface{}) (string, error) {
+	rawURL, ok := args["url"].(string)
+	if !ok || rawURL == "" {
+		return "", fmt.Errorf("url is required and must be a string")
 	}
-	method := strings.ToUpper(argString(a, "method"))
+
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil {
+		return "", fmt.Errorf("invalid URL: %s", err.Error())
+	}
+
+	if len(ht.allowedHosts) > 0 {
+		host := parsedURL.Hostname()
+		allowed := false
+		for _, a := range ht.allowedHosts {
+			if a == "*" || host == a || strings.HasSuffix(host, "."+a) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return "", fmt.Errorf("host %s is not in the allowed list: %v", host, ht.allowedHosts)
+		}
+	}
+
+	method, _ := args["method"].(string)
 	if method == "" {
 		method = "GET"
 	}
-	ctx, cancel := context.WithTimeout(ctx, wt.timeout)
-	defer cancel()
+	method = strings.ToUpper(method)
 
-	var body io.Reader
-	if b := argString(a, "body"); b != "" {
-		body = strings.NewReader(b)
+	var bodyReader io.Reader
+	if body, ok := args["body"].(string); ok && body != "" {
+		bodyReader = strings.NewReader(body)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, url, body)
-	if err != nil {
-		return "", err
+
+	contentType, _ := args["content_type"].(string)
+	if contentType == "" && bodyReader != nil {
+		bodyStr, _ := args["body"].(string)
+		trimmed := strings.TrimSpace(bodyStr)
+		if len(trimmed) > 0 && trimmed[0] == '{' {
+			contentType = "application/json"
+		}
 	}
-	resp, err := http.DefaultClient.Do(req)
+
+	maxSize := int64(1048576) // 1MB default
+	if maxArg, ok := args["max_response_size"].(float64); ok {
+		maxSize = int64(maxArg)
+		if maxSize < 0 {
+			maxSize = 1048576
+		}
+	}
+
+	followRedirects := false
+	if followArg, ok := args["follow_redirects"].(bool); ok {
+		followRedirects = followArg
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, rawURL, bodyReader)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("creating request: %s", err.Error())
+	}
+
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	req.Header.Set("User-Agent", "goclaw-http-tool/1.0")
+
+	if headers, ok := args["headers"].(map[string]interface{}); ok {
+		for kStr, v := range headers {
+			if vs, ok := v.(string); ok {
+				req.Header.Set(kStr, vs)
+			}
+		}
+	}
+
+	if followRedirects {
+		ht.client.CheckRedirect = nil
+	} else {
+		ht.client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+	}
+
+	startTime := time.Now()
+	resp, err := ht.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("request failed: %s", err.Error())
 	}
 	defer resp.Body.Close()
 
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
-	var b strings.Builder
-	fmt.Fprintf(&b, "%s\n", resp.Status)
-	fmt.Fprintf(&b, "Content-Type: %s\n\n", resp.Header.Get("Content-Type"))
-	b.Write(data)
-	if resp.ContentLength > maxBodyBytes || len(data) == maxBodyBytes {
-		b.WriteString("\n...(truncated)")
+	duration := time.Since(startTime)
+
+	var bodyBytes []byte
+	if maxSize > 0 {
+		bodyBytes, err = io.ReadAll(io.LimitReader(resp.Body, maxSize))
+	} else {
+		bodyBytes, err = io.ReadAll(resp.Body)
 	}
-	return b.String(), nil
+	if err != nil {
+		return "", fmt.Errorf("reading response body: %s", err.Error())
+	}
+
+	var sb strings.Builder
+	sb.WriteString("=== HTTP Response ===\n")
+	sb.WriteString(fmt.Sprintf("URL: %s\n", rawURL))
+	sb.WriteString(fmt.Sprintf("Method: %s\n", method))
+	sb.WriteString(fmt.Sprintf("Status: %d %s\n", resp.StatusCode, resp.Status))
+	sb.WriteString(fmt.Sprintf("Duration: %v\n", duration.Round(time.Millisecond)))
+	sb.WriteString(fmt.Sprintf("Size: %d bytes\n", len(bodyBytes)))
+
+	sb.WriteString("\n--- Headers ---\n")
+	for key, values := range resp.Header {
+		for _, v := range values {
+			sb.WriteString(fmt.Sprintf("%s: %s\n", key, v))
+		}
+	}
+
+	sb.WriteString("\n--- Body ---\n")
+	bodyStr := string(bodyBytes)
+	if len(bodyStr) > 0 {
+		sb.WriteString(bodyStr)
+		if len(bodyStr) >= int(maxSize) && maxSize > 0 {
+			sb.WriteString("\n\n... (truncated, response exceeded max_response_size)")
+		}
+	} else {
+		sb.WriteString("(empty)")
+	}
+
+	return sb.String(), nil
+}
+
+var parseHTMLSchema = map[string]interface{}{
+	"type": "object",
+	"properties": map[string]interface{}{
+		"url": map[string]interface{}{
+			"type":        "string",
+			"description": "The URL of the HTML page to parse",
+		},
+		"input": map[string]interface{}{
+			"type":        "string",
+			"description": "Raw HTML content to parse (alternative to url — provides HTML directly)",
+		},
+		"mode": map[string]interface{}{
+			"type":        "string",
+			"description": "Parsing mode: 'text' (extract visible text only), 'headings' (extract heading levels and text), 'links' (extract all links with text and URLs), 'meta' (extract meta tags: title, description, og tags), 'structure' (extract tag structure with indentation). Default: text",
+		},
+		"selectors": map[string]interface{}{
+			"type":        "array",
+			"description": "CSS-like selectors to extract specific elements. Format: tag#id, .class, tag.class, tag[attr=val]. Only works with mode='text' or mode='structure'.",
+			"items": map[string]interface{}{
+				"type": "string",
+			},
+		},
+	},
+}
+
+func (ht *httpTools) parseHTML(ctx context.Context, args map[string]interface{}) (string, error) {
+	var htmlStr string
+
+	if u, ok := args["url"].(string); ok && u != "" {
+		resp, err := ht.client.Get(u)
+		if err != nil {
+			return "", fmt.Errorf("fetching URL: %s", err.Error())
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return "", fmt.Errorf("HTTP %d for %s", resp.StatusCode, u)
+		}
+		bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024))
+		if err != nil {
+			return "", fmt.Errorf("reading response: %s", err.Error())
+		}
+		htmlStr = string(bodyBytes)
+	} else if input, ok := args["input"].(string); ok && input != "" {
+		htmlStr = input
+	} else {
+		return "", fmt.Errorf("either 'url' or 'input' is required")
+	}
+
+	doc, err := nethtml.Parse(strings.NewReader(htmlStr))
+	if err != nil {
+		return "", fmt.Errorf("parsing HTML: %s", err.Error())
+	}
+
+	mode, _ := args["mode"].(string)
+	if mode == "" {
+		mode = "text"
+	}
+
+	switch mode {
+	case "text":
+		return ht.extractText(doc, args["selectors"]), nil
+	case "headings":
+		return ht.extractHeadings(doc), nil
+	case "links":
+		return ht.extractLinks(doc), nil
+	case "meta":
+		return ht.extractMeta(doc), nil
+	case "structure":
+		return ht.extractStructure(doc, args["selectors"]), nil
+	default:
+		return "", fmt.Errorf("unknown mode '%s'. Valid modes: text, headings, links, meta, structure", mode)
+	}
+}
+
+func (ht *httpTools) extractText(doc *nethtml.Node, selectorsArg interface{}) string {
+	var sb strings.Builder
+	var lastWasSpace bool
+
+	var walk func(*nethtml.Node)
+	walk = func(n *nethtml.Node) {
+		if n.Type == nethtml.TextNode {
+			text := strings.TrimSpace(n.Data)
+			if text != "" {
+				if isIgnoredNode(n) {
+					return
+				}
+				if lastWasSpace {
+					sb.WriteString(" ")
+				}
+				sb.WriteString(text)
+				lastWasSpace = true
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+
+	if selectors, ok := selectorsArg.([]interface{}); ok && len(selectors) > 0 {
+		selectorStrs := make([]string, 0, len(selectors))
+		for _, s := range selectors {
+			if ss, ok := s.(string); ok {
+				selectorStrs = append(selectorStrs, ss)
+			}
+		}
+		matchingNodes := ht.findNodesBySelector(doc, selectorStrs)
+		for _, node := range matchingNodes {
+			var walkNodeFn func(*nethtml.Node)
+			walkNodeFn = func(n *nethtml.Node) {
+				if n.Type == nethtml.TextNode {
+					text := strings.TrimSpace(n.Data)
+					if text != "" && !isIgnoredNode(n) {
+						if lastWasSpace {
+							sb.WriteString("\n")
+						}
+						sb.WriteString(text)
+						lastWasSpace = true
+					}
+				}
+				for c := n.FirstChild; c != nil; c = c.NextSibling {
+					walkNodeFn(c)
+				}
+			}
+			walkNodeFn(node)
+		}
+	} else {
+		walk(doc)
+	}
+
+	return strings.TrimSpace(sb.String())
+}
+
+func isIgnoredNode(n *nethtml.Node) bool {
+	current := n
+	for current != nil {
+		if current.Type == nethtml.ElementNode {
+			tag := strings.ToLower(current.Data)
+			if tag == "script" || tag == "style" || tag == "nav" || tag == "footer" || tag == "header" || tag == "aside" {
+				return true
+			}
+		}
+		current = current.Parent
+	}
+	return false
+}
+
+func (ht *httpTools) extractHeadings(doc *nethtml.Node) string {
+	var sb strings.Builder
+	var walk func(*nethtml.Node, int)
+	walk = func(n *nethtml.Node, depth int) {
+		if n.Type == nethtml.ElementNode {
+			tag := strings.ToLower(n.Data)
+			if strings.HasPrefix(tag, "h") && len(tag) == 2 {
+				level := int(tag[1] - '0')
+				if level >= 1 && level <= 6 {
+					var text strings.Builder
+					for c := n.FirstChild; c != nil; c = c.NextSibling {
+						if c.Type == nethtml.TextNode {
+							text.WriteString(strings.TrimSpace(c.Data))
+						}
+					}
+					if text.Len() > 0 {
+						sb.WriteString(fmt.Sprintf("%s %d. %s\n", strings.Repeat("#", level), level, text.String()))
+					}
+				}
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c, depth+1)
+		}
+	}
+	walk(doc, 0)
+	return strings.TrimSpace(sb.String())
+}
+
+func (ht *httpTools) extractLinks(doc *nethtml.Node) string {
+	var sb strings.Builder
+	var count int
+	var walk func(*nethtml.Node)
+	walk = func(n *nethtml.Node) {
+		if n.Type == nethtml.ElementNode && strings.ToLower(n.Data) == "a" {
+			var href, text string
+			for _, attr := range n.Attr {
+				if attr.Key == "href" {
+					href = attr.Val
+				}
+				if attr.Key == "text" || attr.Key == "title" {
+					text = attr.Val
+				}
+			}
+			if text == "" {
+				var textBuilder strings.Builder
+				for c := n.FirstChild; c != nil; c = c.NextSibling {
+					if c.Type == nethtml.TextNode {
+						textBuilder.WriteString(strings.TrimSpace(c.Data))
+					}
+				}
+				text = textBuilder.String()
+			}
+			if href != "" {
+				count++
+				sb.WriteString(fmt.Sprintf("%d. [%s](%s)\n", count, text, href))
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(doc)
+	if count == 0 {
+		return "No links found."
+	}
+	return fmt.Sprintf("Found %d links:\n%s", count, sb.String())
+}
+
+func (ht *httpTools) extractMeta(doc *nethtml.Node) string {
+	var sb strings.Builder
+	var title strings.Builder
+
+	var walk func(*nethtml.Node)
+	walk = func(n *nethtml.Node) {
+		if n.Type == nethtml.ElementNode {
+			tag := strings.ToLower(n.Data)
+			if tag == "title" {
+				for c := n.FirstChild; c != nil; c = c.NextSibling {
+					if c.Type == nethtml.TextNode {
+						title.WriteString(strings.TrimSpace(c.Data))
+					}
+				}
+			}
+			if tag == "meta" {
+				name, content := "", ""
+				for _, attr := range n.Attr {
+					lowerKey := strings.ToLower(attr.Key)
+					if lowerKey == "name" || lowerKey == "property" {
+						name = attr.Val
+					}
+					if lowerKey == "content" {
+						content = attr.Val
+					}
+				}
+				if name != "" && content != "" {
+					sb.WriteString(fmt.Sprintf("%s: %s\n", name, content))
+				}
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(doc)
+
+	sb.WriteString(fmt.Sprintf("Title: %s\n", title.String()))
+	return strings.TrimSpace(sb.String())
+}
+
+func (ht *httpTools) extractStructure(doc *nethtml.Node, selectorsArg interface{}) string {
+	var sb strings.Builder
+	var indent int
+
+	if selectors, ok := selectorsArg.([]interface{}); ok && len(selectors) > 0 {
+		selectorStrs := make([]string, 0, len(selectors))
+		for _, s := range selectors {
+			if ss, ok := s.(string); ok {
+				selectorStrs = append(selectorStrs, ss)
+			}
+		}
+		matchingNodes := ht.findNodesBySelector(doc, selectorStrs)
+		if len(matchingNodes) > 0 {
+			for _, node := range matchingNodes {
+				indent = 0
+				ht.writeStructure(node, &sb, &indent)
+			}
+			return strings.TrimSpace(sb.String())
+		}
+	}
+
+	ht.writeStructure(doc, &sb, &indent)
+	return strings.TrimSpace(sb.String())
+}
+
+func (ht *httpTools) writeStructure(n *nethtml.Node, sb *strings.Builder, indent *int) {
+	if n.Type == nethtml.TextNode {
+		text := strings.TrimSpace(n.Data)
+		if text != "" {
+			sb.WriteString(strings.Repeat("  ", *indent) + text + "\n")
+		}
+		return
+	}
+
+	if n.Type == nethtml.ElementNode {
+		parts := []string{strings.ToLower(n.Data)}
+		for _, attr := range n.Attr {
+			if attr.Key != "" {
+				parts = append(parts, fmt.Sprintf("%s=%q", attr.Key, attr.Val))
+			}
+		}
+		sb.WriteString(strings.Repeat("  ", *indent) + strings.Join(parts, " ") + "\n")
+		*indent++
+	}
+
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		ht.writeStructure(c, sb, indent)
+	}
+
+	if n.Type == nethtml.ElementNode {
+		*indent--
+	}
+}
+
+var parseJSONSchema = map[string]interface{}{
+	"type": "object",
+	"properties": map[string]interface{}{
+		"url": map[string]interface{}{
+			"type":        "string",
+			"description": "The URL of the JSON endpoint to fetch",
+		},
+		"input": map[string]interface{}{
+			"type":        "string",
+			"description": "Raw JSON string to parse (alternative to url — provides JSON directly)",
+		},
+		"indent": map[string]interface{}{
+			"type":        "integer",
+			"description": "Number of spaces for indentation. Default: 2. Set to 0 for compact output.",
+		},
+		"keys": map[string]interface{}{
+			"type":        "array",
+			"description": "Dot-notation key paths to extract specific values. e.g. ['data.items', 'data.items[0].name']. If provided, only extracts those paths.",
+			"items": map[string]interface{}{
+				"type": "string",
+			},
+		},
+	},
+	"required": []string{},
+}
+
+func (ht *httpTools) parseJSON(ctx context.Context, args map[string]interface{}) (string, error) {
+	var jsonStr string
+
+	if u, ok := args["url"].(string); ok && u != "" {
+		resp, err := ht.client.Get(u)
+		if err != nil {
+			return "", fmt.Errorf("fetching URL: %s", err.Error())
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return "", fmt.Errorf("HTTP %d for %s", resp.StatusCode, u)
+		}
+		bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024))
+		if err != nil {
+			return "", fmt.Errorf("reading response: %s", err.Error())
+		}
+		jsonStr = string(bodyBytes)
+	} else if input, ok := args["input"].(string); ok && input != "" {
+		jsonStr = input
+	} else {
+		return "", fmt.Errorf("either 'url' or 'input' is required")
+	}
+
+	var raw interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &raw); err != nil {
+		return "", fmt.Errorf("parsing JSON: %s\n\nRaw input (first 500 chars):\n%s", err.Error(), truncate(jsonStr, 500))
+	}
+
+	if keysArg, ok := args["keys"].([]interface{}); ok && len(keysArg) > 0 {
+		keyPaths := make([]string, 0, len(keysArg))
+		for _, k := range keysArg {
+			if ks, ok := k.(string); ok {
+				keyPaths = append(keyPaths, ks)
+			}
+		}
+		return ht.extractJSONPaths(raw, keyPaths), nil
+	}
+
+	indent := 2
+	if indentArg, ok := args["indent"].(float64); ok {
+		indent = int(indentArg)
+		if indent < 0 {
+			indent = 2
+		}
+	}
+
+	var output string
+	if indent == 0 {
+		output = jsonStr
+	} else {
+		formatted, err := json.MarshalIndent(raw, "", strings.Repeat(" ", indent))
+		if err != nil {
+			return "", fmt.Errorf("formatting JSON: %s", err.Error())
+		}
+		output = string(formatted)
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("=== JSON (%d bytes) ===\n", len(jsonStr)))
+	sb.WriteString(ht.describeJSON(raw, 0))
+	sb.WriteString("\n\n")
+	sb.WriteString(output)
+
+	return sb.String(), nil
+}
+
+func (ht *httpTools) describeJSON(v interface{}, depth int) string {
+	var sb strings.Builder
+	indent := strings.Repeat("  ", depth)
+
+	switch val := v.(type) {
+	case map[string]interface{}:
+		sb.WriteString(fmt.Sprintf("%sObject with %d keys:\n", indent, len(val)))
+		keys := make([]string, 0, len(val))
+		for k := range val {
+			keys = append(keys, k)
+		}
+		if len(keys) > 10 {
+			keys = keys[:10]
+		}
+		for _, k := range keys {
+			sb.WriteString(fmt.Sprintf("%s  - %s: %s\n", indent, k, ht.typeName(val[k])))
+		}
+		if len(val) > 10 {
+			sb.WriteString(fmt.Sprintf("%s  ... and %d more keys\n", indent, len(val)-10))
+		}
+	case []interface{}:
+		sb.WriteString(fmt.Sprintf("%sArray with %d items:\n", indent, len(val)))
+		if len(val) > 0 {
+			sb.WriteString(fmt.Sprintf("%s  [0]: %s\n", indent, ht.typeName(val[0])))
+		}
+		if len(val) > 10 {
+			sb.WriteString(fmt.Sprintf("%s  ... and %d more items\n", indent, len(val)-10))
+		}
+		showCount := len(val)
+		if showCount > 5 {
+			showCount = 5
+		}
+		for i := 0; i < showCount; i++ {
+			sb.WriteString(fmt.Sprintf("%s  [%d]: %s\n", indent, i, ht.describeSimple(val[i])))
+		}
+	case string:
+		display := val
+		if len(display) > 100 {
+			display = display[:100] + "..."
+		}
+		sb.WriteString(fmt.Sprintf("%sString: %q\n", indent, display))
+	case float64:
+		sb.WriteString(fmt.Sprintf("%sNumber: %.2f\n", indent, val))
+	case bool:
+		sb.WriteString(fmt.Sprintf("%sBoolean: %v\n", indent, val))
+	case nil:
+		sb.WriteString(fmt.Sprintf("%sNull\n", indent))
+	default:
+		sb.WriteString(fmt.Sprintf("%s%T: %v\n", indent, val, val))
+	}
+	return sb.String()
+}
+
+func (ht *httpTools) typeName(v interface{}) string {
+	switch v.(type) {
+	case map[string]interface{}:
+		return "object"
+	case []interface{}:
+		return "array"
+	case string:
+		return "string"
+	case float64:
+		return "number"
+	case bool:
+		return "boolean"
+	case nil:
+		return "null"
+	default:
+		return fmt.Sprintf("%T", v)
+	}
+}
+
+func (ht *httpTools) describeSimple(v interface{}) string {
+	switch val := v.(type) {
+	case string:
+		if len(val) > 80 {
+			return fmt.Sprintf("%q...", val[:80])
+		}
+		return fmt.Sprintf("%q", val)
+	case float64:
+		return fmt.Sprintf("%.2f", val)
+	case bool:
+		return fmt.Sprintf("%v", val)
+	case nil:
+		return "null"
+	case map[string]interface{}:
+		return fmt.Sprintf("{%d keys}", len(val))
+	case []interface{}:
+		return fmt.Sprintf("[%d items]", len(val))
+	default:
+		return fmt.Sprintf("%v", val)
+	}
+}
+
+func (ht *httpTools) extractJSONPaths(root interface{}, paths []string) string {
+	var sb strings.Builder
+	sb.WriteString("=== JSON Path Extraction ===\n\n")
+
+	for _, path := range paths {
+		val := ht.getJSONPath(root, path)
+		if val != nil {
+			formatted, err := json.MarshalIndent(val, "", "  ")
+			if err != nil {
+				sb.WriteString(fmt.Sprintf("%s: (error formatting: %s)\n\n", path, err.Error()))
+			} else {
+				sb.WriteString(fmt.Sprintf("%s:\n%s\n\n", path, string(formatted)))
+			}
+		} else {
+			sb.WriteString(fmt.Sprintf("%s: (not found)\n\n", path))
+		}
+	}
+
+	return sb.String()
+}
+
+func (ht *httpTools) getJSONPath(v interface{}, path string) interface{} {
+	parts := ht.splitPath(path)
+	current := v
+
+	for i, part := range parts {
+		if current == nil {
+			return nil
+		}
+
+		switch val := current.(type) {
+		case map[string]interface{}:
+			bracketIdx := strings.Index(part, "[")
+			if bracketIdx > 0 && strings.HasSuffix(part, "]") {
+				key := part[:bracketIdx]
+				idxStr := part[bracketIdx+1 : len(part)-1]
+				var arrIdx int
+				fmt.Sscanf(idxStr, "%d", &arrIdx)
+				if arrVal, ok := val[key].([]interface{}); ok {
+					if arrIdx < 0 || arrIdx >= len(arrVal) {
+						return nil
+					}
+					current = arrVal[arrIdx]
+				} else {
+					return nil
+				}
+			} else {
+				if next, ok := val[part]; ok {
+					current = next
+				} else {
+					return nil
+				}
+			}
+		case []interface{}:
+			idx := strings.Index(part, "[")
+			if idx > 0 {
+				key := part[:idx]
+				idxStr := part[idx+1 : len(part)-1]
+				var arrayIdx int
+				fmt.Sscanf(idxStr, "%d", &arrayIdx)
+				if arrayIdx < 0 || arrayIdx >= len(val) {
+					return nil
+				}
+				if key != "" {
+					if arrVal, ok := val[arrayIdx].(map[string]interface{}); ok {
+						if next, ok := arrVal[key]; ok {
+							current = next
+						} else {
+							return nil
+						}
+					} else {
+						return nil
+					}
+				} else {
+					current = val[arrayIdx]
+				}
+			} else {
+				var directIdx int
+				fmt.Sscanf(part, "%d", &directIdx)
+				if directIdx < 0 || directIdx >= len(val) {
+					return nil
+				}
+				current = val[directIdx]
+			}
+		default:
+			return nil
+		}
+
+		if i == len(parts)-1 {
+			return current
+		}
+	}
+
+	return current
+}
+
+func (ht *httpTools) splitPath(path string) []string {
+	var parts []string
+	var current strings.Builder
+
+	for i := 0; i < len(path); i++ {
+		ch := path[i]
+		if ch == '[' {
+			end := strings.Index(path[i:], "]")
+			if end > 0 {
+				current.WriteString(path[i : i+end+1])
+				i += end
+			} else {
+				current.WriteByte(ch)
+			}
+		} else if ch == '.' {
+			if current.Len() > 0 {
+				parts = append(parts, current.String())
+				current.Reset()
+			}
+		} else {
+			current.WriteByte(ch)
+		}
+	}
+	if current.Len() > 0 {
+		parts = append(parts, current.String())
+	}
+	return parts
+}
+
+var parseCSSSchema = map[string]interface{}{
+	"type": "object",
+	"properties": map[string]interface{}{
+		"url": map[string]interface{}{
+			"type":        "string",
+			"description": "The URL of the HTML page to query",
+		},
+		"input": map[string]interface{}{
+			"type":        "string",
+			"description": "Raw HTML content to query (alternative to url)",
+		},
+		"selector": map[string]interface{}{
+			"type":        "string",
+			"description": "CSS selector to match elements. Supports: tag, .class, #id, tag.class, tag#id, tag[attr], tag[attr=val], tag > tag, tag + tag, tag ~ tag, :contains(text)",
+		},
+		"attribute": map[string]interface{}{
+			"type":        "string",
+			"description": "If set, returns only the value of this attribute from matched elements. If omitted, returns the text content.",
+		},
+		"limit": map[string]interface{}{
+			"type":        "integer",
+			"description": "Maximum number of results to return. Default: 50.",
+		},
+	},
+	"required": []string{"selector"},
+}
+
+func (ht *httpTools) parseCSS(ctx context.Context, args map[string]interface{}) (string, error) {
+	var htmlStr string
+
+	if u, ok := args["url"].(string); ok && u != "" {
+		resp, err := ht.client.Get(u)
+		if err != nil {
+			return "", fmt.Errorf("fetching URL: %s", err.Error())
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return "", fmt.Errorf("HTTP %d for %s", resp.StatusCode, u)
+		}
+		bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024))
+		if err != nil {
+			return "", fmt.Errorf("reading response: %s", err.Error())
+		}
+		htmlStr = string(bodyBytes)
+	} else if input, ok := args["input"].(string); ok && input != "" {
+		htmlStr = input
+	} else {
+		return "", fmt.Errorf("either 'url' or 'input' is required")
+	}
+
+	doc, err := nethtml.Parse(strings.NewReader(htmlStr))
+	if err != nil {
+		return "", fmt.Errorf("parsing HTML: %s", err.Error())
+	}
+
+	selector, _ := args["selector"].(string)
+	if selector == "" {
+		return "", fmt.Errorf("selector is required")
+	}
+
+	matchedNodes := ht.querySelectorAll(doc, selector)
+
+	limit := 50
+	if limitArg, ok := args["limit"].(float64); ok {
+		limit = int(limitArg)
+		if limit < 1 {
+			limit = 50
+		}
+	}
+
+	if len(matchedNodes) > limit {
+		matchedNodes = matchedNodes[:limit]
+	}
+
+	attribute, _ := args["attribute"].(string)
+	var sb strings.Builder
+
+	if len(matchedNodes) == 0 {
+		sb.WriteString(fmt.Sprintf("No elements matched selector: %s", selector))
+	} else {
+		sb.WriteString(fmt.Sprintf("Found %d matching elements (selector: %s):\n\n", len(matchedNodes), selector))
+		for i, node := range matchedNodes {
+			sb.WriteString(fmt.Sprintf("--- Result %d ---\n", i+1))
+			if attribute != "" {
+				for _, attr := range node.Attr {
+					if attr.Key == attribute {
+						sb.WriteString(fmt.Sprintf("%s: %s\n", attribute, attr.Val))
+						break
+					}
+				}
+			} else {
+				sb.WriteString(ht.nodeText(node))
+			}
+			sb.WriteString("\n")
+		}
+	}
+
+	return sb.String(), nil
+}
+
+func (ht *httpTools) nodeText(n *nethtml.Node) string {
+	var sb strings.Builder
+	var walk func(*nethtml.Node)
+	walk = func(node *nethtml.Node) {
+		if node.Type == nethtml.TextNode {
+			sb.WriteString(strings.TrimSpace(node.Data))
+		}
+		for c := node.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(n)
+	return strings.TrimSpace(sb.String())
+}
+
+// --- basic CSS selector matching ---
+
+func (ht *httpTools) findNodesBySelector(root *nethtml.Node, selectors []string) []*nethtml.Node {
+	var results []*nethtml.Node
+	allNodes := ht.getAllNodes(root)
+
+	for _, sel := range selectors {
+		for _, node := range allNodes {
+			if ht.matchesSelector(node, sel) {
+				results = append(results, node)
+			}
+		}
+	}
+	return results
+}
+
+func (ht *httpTools) querySelectorAll(root *nethtml.Node, selector string) []*nethtml.Node {
+	allNodes := ht.getAllNodes(root)
+	var results []*nethtml.Node
+
+	for _, node := range allNodes {
+		if ht.matchesSelector(node, selector) {
+			results = append(results, node)
+		}
+	}
+	return results
+}
+
+func (ht *httpTools) getAllNodes(root *nethtml.Node) []*nethtml.Node {
+	var nodes []*nethtml.Node
+	var walk func(*nethtml.Node)
+	walk = func(n *nethtml.Node) {
+		nodes = append(nodes, n)
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(root)
+	return nodes
+}
+
+func (ht *httpTools) matchesSelector(node *nethtml.Node, selector string) bool {
+	if node.Type != nethtml.ElementNode {
+		return false
+	}
+
+	selector = strings.TrimSpace(selector)
+	if selector == "*" {
+		return true
+	}
+
+	tag := strings.ToLower(node.Data)
+
+	expectedTag := ""
+	var classes []string
+	var id string
+	var attrSelectors []string
+
+	containsText := ""
+	if idx := strings.Index(selector, ":contains("); idx >= 0 {
+		closeIdx := strings.Index(selector[idx:], ")")
+		if closeIdx > 0 {
+			containsText = strings.ToLower(selector[idx+10 : idx+closeIdx])
+			selector = selector[:idx] + selector[idx+closeIdx+1:]
+		}
+	}
+
+	selector = strings.TrimSpace(selector)
+
+	remaining := selector
+	for {
+		bracketStart := strings.Index(remaining, "[")
+		if bracketStart < 0 {
+			break
+		}
+		bracketEnd := strings.Index(remaining, "]")
+		if bracketEnd < 0 {
+			break
+		}
+		attrSel := remaining[bracketStart+1 : bracketEnd]
+		attrSelectors = append(attrSelectors, attrSel)
+		remaining = remaining[:bracketStart] + remaining[bracketEnd+1:]
+	}
+	remaining = strings.TrimSpace(remaining)
+
+	var tokens []string
+	var delimiters []rune
+	current := []rune{}
+	for _, r := range remaining {
+		if r == '.' || r == '#' {
+			if len(current) > 0 {
+				tokens = append(tokens, string(current))
+				current = nil
+			}
+			delimiters = append(delimiters, r)
+		} else {
+			current = append(current, r)
+		}
+	}
+	if len(current) > 0 {
+		tokens = append(tokens, string(current))
+	}
+
+	if len(tokens) > 0 {
+		if len(remaining) > 0 && (remaining[0] == '.' || remaining[0] == '#') {
+			expectedTag = ""
+		} else {
+			expectedTag = strings.ToLower(tokens[0])
+		}
+	}
+
+	tokenStart := 0
+	if expectedTag != "" {
+		tokenStart = 1
+	}
+	for i := tokenStart; i < len(tokens); i++ {
+		delIdx := i - tokenStart
+		if delIdx < len(delimiters) {
+			switch delimiters[delIdx] {
+			case '.':
+				classes = append(classes, tokens[i])
+			case '#':
+				id = tokens[i]
+			}
+		}
+	}
+
+	if expectedTag != "" && expectedTag != tag {
+		return false
+	}
+
+	for _, c := range classes {
+		hasClass := false
+		for _, attr := range node.Attr {
+			if attr.Key == "class" {
+				for _, cls := range strings.Fields(attr.Val) {
+					if cls == c {
+						hasClass = true
+						break
+					}
+				}
+			}
+		}
+		if !hasClass {
+			return false
+		}
+	}
+
+	if id != "" {
+		hasID := false
+		for _, attr := range node.Attr {
+			if attr.Key == "id" && attr.Val == id {
+				hasID = true
+				break
+			}
+		}
+		if !hasID {
+			return false
+		}
+	}
+
+	for _, attrSel := range attrSelectors {
+		attrName := attrSel
+		attrVal := ""
+		hasEqual := false
+		if eqIdx := strings.Index(attrSel, "="); eqIdx > 0 {
+			attrName = attrSel[:eqIdx]
+			attrVal = attrSel[eqIdx+1:]
+			hasEqual = true
+			if len(attrVal) >= 2 && ((attrVal[0] == '"' && attrVal[len(attrVal)-1] == '"') ||
+				(attrVal[0] == '\'' && attrVal[len(attrVal)-1] == '\'')) {
+				attrVal = attrVal[1 : len(attrVal)-1]
+			}
+		}
+		hasAttr := false
+		for _, attr := range node.Attr {
+			if attr.Key == attrName {
+				if !hasEqual || attr.Val == attrVal {
+					hasAttr = true
+					break
+				}
+			}
+		}
+		if !hasAttr {
+			return false
+		}
+	}
+
+	if containsText != "" {
+		nodeText := strings.ToLower(ht.nodeText(node))
+		if !strings.Contains(nodeText, containsText) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
+// =============================================================================
+// webSearchTools: Ollama-backed web search + fetch (web_search_small,
+// web_search_full, web_search_raw, web_fetch). Ported from goclaw
+// internal/tools/web_search_tool.go. Results are cached under <root>/web_cache.
+// =============================================================================
+
+type ollamaWebSearchResult struct {
+	Title   string `json:"title"`
+	URL     string `json:"url"`
+	Content string `json:"content"`
+}
+
+type ollamaWebSearchResponse struct {
+	Results []ollamaWebSearchResult `json:"results"`
+}
+
+type ollamaWebFetchResult struct {
+	Title   string   `json:"title"`
+	Content string   `json:"content"`
+	Links   []string `json:"links"`
+}
+
+// webSearchTools provides web search/fetch tools backed by Ollama's API.
+type webSearchTools struct {
+	root string // workspace dir; holds .env (OLLAMA_API_KEY) and web_cache
+	mu   sync.Mutex
+}
+
+func (ws *webSearchTools) register(r *Registry) {
+	r.Register(&Tool{
+		Name:        "web_search_small",
+		Description: "Search the web and return only titles and URLs (full content cached to disk).",
+		Schema:      webSearchSmallSchema,
+		ReadOnly:    true,
+		Handler:     ws.webSearchSmall,
+	})
+	r.Register(&Tool{
+		Name:        "web_search_full",
+		Description: "Search the web and return titles, URLs, and content snippets.",
+		Schema:      webSearchFullSchema,
+		ReadOnly:    true,
+		Handler:     ws.webSearchFull,
+	})
+	r.Register(&Tool{
+		Name:        "web_search_raw",
+		Description: "Search the web and return the raw JSON response from Ollama.",
+		Schema:      webSearchRawSchema,
+		ReadOnly:    true,
+		Handler:     ws.webSearchRaw,
+	})
+	r.Register(&Tool{
+		Name:        "web_fetch",
+		Description: "Fetch the full content of a single URL via Ollama's web fetch API.",
+		Schema:      webFetchSchema,
+		ReadOnly:    true,
+		Handler:     ws.webFetch,
+	})
+}
+
+// readEnvKey reads an env var, falling back to <root>/.env.
+func (ws *webSearchTools) readEnvKey(key string) string {
+	if val := os.Getenv(key); val != "" {
+		return val
+	}
+	if ws.root == "" {
+		return ""
+	}
+	data, err := os.ReadFile(filepath.Join(ws.root, ".env"))
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) == 2 && strings.TrimSpace(parts[0]) == key {
+			return strings.TrimSpace(parts[1])
+		}
+	}
+	return ""
+}
+
+func (ws *webSearchTools) cacheDir() string {
+	if ws.root == "" {
+		return ""
+	}
+	return filepath.Join(ws.root, "web_cache")
+}
+
+func (ws *webSearchTools) ensureCacheDir() error {
+	dir := ws.cacheDir()
+	if dir == "" {
+		return nil
+	}
+	return os.MkdirAll(dir, 0755)
+}
+
+func (ws *webSearchTools) cachePath(query string) string {
+	slug := strings.ReplaceAll(strings.ToLower(query), " ", "_")
+	slug = strings.ReplaceAll(slug, "/", "_")
+	if len(slug) > 200 {
+		slug = slug[:200]
+	}
+	return filepath.Join(ws.cacheDir(), fmt.Sprintf("%s.json", slug))
+}
+
+func (ws *webSearchTools) fetchCachePath(u string) string {
+	slug := strings.ReplaceAll(strings.ToLower(u), " ", "_")
+	slug = strings.ReplaceAll(slug, "/", "_")
+	if len(slug) > 200 {
+		slug = slug[:200]
+	}
+	return filepath.Join(ws.cacheDir(), fmt.Sprintf("fetch_%s.json", slug))
+}
+
+func (ws *webSearchTools) queryOllamaSearch(query string, maxResults int) (*ollamaWebSearchResponse, error) {
+	apiKey := ws.readEnvKey("OLLAMA_API_KEY")
+	if apiKey == "" {
+		return nil, fmt.Errorf("OLLAMA_API_KEY not set — check .env in workspace directory")
+	}
+
+	payload := map[string]interface{}{"query": query}
+	if maxResults > 0 && maxResults <= 10 {
+		payload["max_results"] = maxResults
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling request: %w", err)
+	}
+
+	var resp *http.Response
+	respBody := []byte{}
+	for attempt := 0; attempt < 3; attempt++ {
+		req, err := http.NewRequest("POST", "https://ollama.com/api/web_search", strings.NewReader(string(body)))
+		if err != nil {
+			return nil, fmt.Errorf("creating request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+
+		client := &http.Client{Timeout: 30 * time.Second}
+		resp, err = client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("request failed: %w", err)
+		}
+
+		respBody, err = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("reading response: %w", err)
+		}
+
+		if resp.StatusCode == http.StatusOK {
+			break
+		}
+
+		if resp.StatusCode == 429 || resp.StatusCode >= 500 {
+			backoff := time.Duration(attempt+1) * time.Second
+			log.Printf("[WebSearch] %s retry %d/3: HTTP %d, backing off %v", query, attempt+1, resp.StatusCode, backoff)
+			time.Sleep(backoff)
+			continue
+		}
+
+		log.Printf("[WebSearch] %s: HTTP %d, body=%s", query, resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("ollama API error (HTTP %d, body: %s)", resp.StatusCode, string(respBody))
+	}
+	var result ollamaWebSearchResponse
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return nil, fmt.Errorf("parsing response: %w", err)
+	}
+
+	return &result, nil
+}
+
+func (ws *webSearchTools) queryOllamaFetch(targetURL string) (*ollamaWebFetchResult, error) {
+	apiKey := ws.readEnvKey("OLLAMA_API_KEY")
+	if apiKey == "" {
+		return nil, fmt.Errorf("OLLAMA_API_KEY not set — check .env in workspace directory")
+	}
+
+	payload := map[string]interface{}{"url": targetURL}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling request: %w", err)
+	}
+
+	var resp *http.Response
+	respBody := []byte{}
+	for attempt := 0; attempt < 3; attempt++ {
+		req, err := http.NewRequest("POST", "https://ollama.com/api/web_fetch", strings.NewReader(string(body)))
+		if err != nil {
+			return nil, fmt.Errorf("creating request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+
+		client := &http.Client{Timeout: 30 * time.Second}
+		resp, err = client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("request failed: %w", err)
+		}
+
+		respBody, err = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("reading response: %w", err)
+		}
+
+		if resp.StatusCode == http.StatusOK {
+			break
+		}
+
+		if resp.StatusCode == 429 || resp.StatusCode >= 500 {
+			backoff := time.Duration(attempt+1) * time.Second
+			log.Printf("[WebFetch] %s retry %d/3: HTTP %d, backing off %v", targetURL, attempt+1, resp.StatusCode, backoff)
+			time.Sleep(backoff)
+			continue
+		}
+
+		return nil, fmt.Errorf("ollama fetch API error (HTTP %d): %s", resp.StatusCode, string(respBody))
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("ollama fetch API error after 3 retries (HTTP %d): %s", resp.StatusCode, string(respBody))
+	}
+
+	var result ollamaWebFetchResult
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return nil, fmt.Errorf("parsing response: %w", err)
+	}
+
+	return &result, nil
+}
+
+func (ws *webSearchTools) cacheSearch(query string, resp *ollamaWebSearchResponse) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	if err := ws.ensureCacheDir(); err == nil {
+		if data, err := json.MarshalIndent(resp, "", "  "); err == nil {
+			os.WriteFile(ws.cachePath(query), data, 0644)
+		}
+	}
+}
+
+var webSearchSmallSchema = map[string]interface{}{
+	"type": "object",
+	"properties": map[string]interface{}{
+		"query": map[string]interface{}{
+			"type":        "string",
+			"description": "The search query string",
+		},
+		"max_results": map[string]interface{}{
+			"type":        "integer",
+			"description": "Maximum number of results to return (1-10, default 5)",
+		},
+	},
+	"required": []string{"query"},
+}
+
+func (ws *webSearchTools) webSearchSmall(ctx context.Context, args map[string]interface{}) (string, error) {
+	query, ok := args["query"].(string)
+	if !ok || query == "" {
+		return "", fmt.Errorf("query is required and must be a non-empty string")
+	}
+
+	maxResults := 5
+	if mr, ok := args["max_results"].(float64); ok {
+		if mr >= 1 && mr <= 10 {
+			maxResults = int(mr)
+		}
+	}
+
+	resp, err := ws.queryOllamaSearch(query, maxResults)
+	if err != nil {
+		return "", fmt.Errorf("search failed: %s", err.Error())
+	}
+
+	if len(resp.Results) == 0 {
+		return fmt.Sprintf("No results found for: %s", query), nil
+	}
+
+	ws.cacheSearch(query, resp)
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("=== Search Results: %s (%d results) ===\n\n", query, len(resp.Results)))
+	for i, r := range resp.Results {
+		sb.WriteString(fmt.Sprintf("%d. %s\n   %s\n\n", i+1, r.Title, r.URL))
+	}
+	sb.WriteString("Full results cached to disk. Use web_search_full to get content snippets.\n")
+
+	return sb.String(), nil
+}
+
+var webSearchFullSchema = map[string]interface{}{
+	"type": "object",
+	"properties": map[string]interface{}{
+		"query": map[string]interface{}{
+			"type":        "string",
+			"description": "The search query string",
+		},
+		"max_results": map[string]interface{}{
+			"type":        "integer",
+			"description": "Maximum number of results to return (1-10, default 5)",
+		},
+	},
+	"required": []string{"query"},
+}
+
+func (ws *webSearchTools) webSearchFull(ctx context.Context, args map[string]interface{}) (string, error) {
+	query, ok := args["query"].(string)
+	if !ok || query == "" {
+		return "", fmt.Errorf("query is required and must be a non-empty string")
+	}
+
+	maxResults := 5
+	if mr, ok := args["max_results"].(float64); ok {
+		if mr >= 1 && mr <= 10 {
+			maxResults = int(mr)
+		}
+	}
+
+	resp, err := ws.queryOllamaSearch(query, maxResults)
+	if err != nil {
+		return "", fmt.Errorf("search failed: %s", err.Error())
+	}
+
+	if len(resp.Results) == 0 {
+		return fmt.Sprintf("No results found for: %s", query), nil
+	}
+
+	ws.cacheSearch(query, resp)
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("=== Search Results: %s (%d results) ===\n\n", query, len(resp.Results)))
+	for i, r := range resp.Results {
+		sb.WriteString(fmt.Sprintf("--- %d. %s ---\n", i+1, r.Title))
+		sb.WriteString(fmt.Sprintf("URL: %s\n", r.URL))
+		sb.WriteString(fmt.Sprintf("Content: %s\n\n", r.Content))
+	}
+
+	return sb.String(), nil
+}
+
+var webSearchRawSchema = map[string]interface{}{
+	"type": "object",
+	"properties": map[string]interface{}{
+		"query": map[string]interface{}{
+			"type":        "string",
+			"description": "The search query string",
+		},
+		"max_results": map[string]interface{}{
+			"type":        "integer",
+			"description": "Maximum number of results to return (1-10, default 5)",
+		},
+	},
+	"required": []string{"query"},
+}
+
+func (ws *webSearchTools) webSearchRaw(ctx context.Context, args map[string]interface{}) (string, error) {
+	query, ok := args["query"].(string)
+	if !ok || query == "" {
+		return "", fmt.Errorf("query is required and must be a non-empty string")
+	}
+
+	maxResults := 5
+	if mr, ok := args["max_results"].(float64); ok {
+		if mr >= 1 && mr <= 10 {
+			maxResults = int(mr)
+		}
+	}
+
+	resp, err := ws.queryOllamaSearch(query, maxResults)
+	if err != nil {
+		return "", fmt.Errorf("search failed: %s", err.Error())
+	}
+
+	if len(resp.Results) == 0 {
+		return fmt.Sprintf("No results found for: %s", query), nil
+	}
+
+	ws.cacheSearch(query, resp)
+
+	rawJSON, err := json.MarshalIndent(resp, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("formatting response: %s", err.Error())
+	}
+
+	return string(rawJSON), nil
+}
+
+var webFetchSchema = map[string]interface{}{
+	"type": "object",
+	"properties": map[string]interface{}{
+		"url": map[string]interface{}{
+			"type":        "string",
+			"description": "The URL to fetch (must be an absolute URL)",
+		},
+	},
+	"required": []string{"url"},
+}
+
+func (ws *webSearchTools) webFetch(ctx context.Context, args map[string]interface{}) (string, error) {
+	targetURL, ok := args["url"].(string)
+	if !ok || targetURL == "" {
+		return "", fmt.Errorf("url is required and must be a non-empty string")
+	}
+
+	resp, err := ws.queryOllamaFetch(targetURL)
+	if err != nil {
+		log.Printf("[WebFetch] Error for URL %s: %s", targetURL, err.Error())
+		return "", fmt.Errorf("fetch failed for URL %s: %s", targetURL, err.Error())
+	}
+
+	ws.mu.Lock()
+	if err := ws.ensureCacheDir(); err == nil {
+		if data, err := json.MarshalIndent(resp, "", "  "); err == nil {
+			os.WriteFile(ws.fetchCachePath(targetURL), data, 0644)
+		}
+	}
+	ws.mu.Unlock()
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("=== Fetched: %s ===\n\n", resp.Title))
+	sb.WriteString(fmt.Sprintf("URL: %s\n\n", targetURL))
+
+	content := resp.Content
+	if len(content) > 8000 {
+		content = content[:8000] + " ... [truncated]"
+	}
+	sb.WriteString(content)
+
+	if len(resp.Links) > 0 {
+		sb.WriteString(fmt.Sprintf("\n\n--- Links on page (%d) ---\n", len(resp.Links)))
+		for _, link := range resp.Links {
+			sb.WriteString(fmt.Sprintf("- %s\n", link))
+		}
+	}
+
+	return sb.String(), nil
 }

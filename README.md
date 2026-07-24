@@ -1,9 +1,15 @@
 # mymcp
 
-A small, self-contained **local MCP tool server**. It exposes host tools
-(file I/O, `run_command`, git, http, system info) to any MCP client over plain
-HTTP on loopback, with an optional **bearer token**. Pure Go stdlib, no
-dependencies.
+A small, self-contained **local MCP tool server**. It exposes a full host-tool
+catalog (~79 tools: file I/O, git, `gh`, HTTP/parse, Ollama web search, system
+utilities, and tmux/`run_command`) to any MCP client over plain HTTP on loopback,
+with an optional **bearer token**. Go stdlib plus a single dependency
+(`golang.org/x/net/html`, for the `parse_html`/`parse_css` tools).
+
+This is goclaw's host-tool backend: goclaw mounts these tools over MCP under
+their bare names, so they replace what goclaw used to register natively. Tools
+that bind to goclaw's live process (conversation/context, cron, Telegram,
+opencode/claude, headless-browser rendering) stay native in goclaw.
 
 - **Transport:** MCP Streamable HTTP (`/mcp`) — works with the llama.cpp web-UI
   MCP client and other HTTP MCP clients (which can send a custom

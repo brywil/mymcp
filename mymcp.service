@@ -13,7 +13,10 @@ Wants=network-online.target
 Type=simple
 EnvironmentFile=%h/.config/mymcp/mymcp.env
 # Bearer token is auto-managed at ~/.config/mymcp/token (retrieve: mymcp token).
-ExecStart=%h/.local/bin/mymcp serve --addr ${ADDR} --workspace ${WORKSPACE}
+# LLAMA_URL/LLAMA_MODEL power analyze_image + model_info; TMUX_SOCKET must match
+# the client's tmux server (goclaw uses /tmp/tmux-goclaw). Unset vars expand
+# empty, which the = form tolerates.
+ExecStart=%h/.local/bin/mymcp serve --addr ${ADDR} --workspace ${WORKSPACE} --llama-url=${LLAMA_URL} --llama-model=${LLAMA_MODEL} --tmux-socket=${TMUX_SOCKET} --memory-dir=${MEMORY_DIR}
 Restart=on-failure
 RestartSec=2
 

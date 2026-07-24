@@ -181,7 +181,7 @@ func (s *Server) process(ctx context.Context, req Request, principal string) (re
 			return errResponse(req.ID, CodeInvalidParams, "invalid params"), false
 		}
 		s.o.Logger.Printf("call principal=%q tool=%s", principal, p.Name) // audit log
-		text, isErr := s.o.Tools.CallTool(ctx, p.Name, p.Arguments)
+		text, isErr := s.o.Tools.CallTool(WithPrincipal(ctx, principal), p.Name, p.Arguments)
 		return okResponse(req.ID, CallToolResult{
 			Content: []ToolContent{{Type: "text", Text: text}},
 			IsError: isErr,

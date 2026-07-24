@@ -1,8 +1,10 @@
 # mymcp — design
 
-A small, self-contained **local MCP tool server**: it exposes host tools to any
-MCP client over plain HTTP on loopback, gated by named bearer tokens. Pure Go
-stdlib, no dependencies.
+A small, self-contained **local MCP tool server**: it exposes a full host-tool
+catalog (~79 tools) to any MCP client over plain HTTP on loopback, gated by named
+bearer tokens. Go stdlib plus one dependency (`golang.org/x/net/html`, used by
+the `parse_html`/`parse_css` tools). It is goclaw's host-tool backend — goclaw
+mounts these tools over MCP under their bare names.
 
 ## Scope (and non-scope)
 

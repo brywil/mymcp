@@ -62,7 +62,10 @@ usage:
 serve flags:
   --addr ADDR         listen address (default 127.0.0.1:9443; loopback only)
   --workspace DIR     root the filesystem tools are confined to (default .)
-  --allow-exec        enable run_command + git tools (default true)
+  --allow-exec        enable shell-backed tools: run_command, git, gh, tmux (default true)
+  --llama-url URL     OpenAI-compatible base URL for analyze_image + model_info
+  --llama-model ID    model id reported by model_info
+  --tmux-socket PATH  tmux socket (-S) for tmux tools; empty = default tmux server
   --no-auth           disable bearer auth entirely (open; loopback only)
   --allow-remote      permit a non-loopback bind (prefer fronting with truemtls)
 
@@ -86,7 +89,11 @@ func runServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	addr := fs.String("addr", "127.0.0.1:9443", "listen address (loopback only unless --allow-remote)")
 	workspace := fs.String("workspace", ".", "root directory the filesystem tools are confined to")
-	allowExec := fs.Bool("allow-exec", true, "enable run_command and git tools")
+	allowExec := fs.Bool("allow-exec", true, "enable shell-backed tools (run_command, git, gh, tmux)")
+	llamaURL := fs.String("llama-url", "", "OpenAI-compatible base URL for analyze_image + model_info")
+	llamaModel := fs.String("llama-model", "", "model id reported by model_info")
+	tmuxSocket := fs.String("tmux-socket", "", "tmux socket path (-S); empty uses the default tmux server")
+	memoryDir := fs.String("memory-dir", "", "base dir for per-agent memory (<memory-dir>/<token-name>/); empty uses --workspace")
 	noAuth := fs.Bool("no-auth", false, "disable bearer auth (open server; loopback only)")
 	allowRemote := fs.Bool("allow-remote", false, "permit binding a non-loopback address")
 	_ = fs.Parse(args)
@@ -121,7 +128,15 @@ func runServe(args []string) error {
 	}
 
 	reg := tools.NewRegistry()
-	tools.RegisterAll(reg, tools.Config{Workspace: ws, AllowExec: *allowExec, ExecTimeout: 120 * time.Second})
+	tools.RegisterAll(reg, tools.Config{
+		Workspace:   ws,
+		AllowExec:   *allowExec,
+		ExecTimeout: 120 * time.Second,
+		LlamaURL:    *llamaURL,
+		LlamaModel:  *llamaModel,
+		TmuxSocket:  *tmuxSocket,
+		MemoryDir:   *memoryDir,
+	})
 	srv := mcp.NewServer(mcp.Options{Tools: reg, Authenticate: authenticate, ServerName: "mymcp", Version: version})
 
 	if *allowRemote && !isLoopback(host) && *noAuth {
