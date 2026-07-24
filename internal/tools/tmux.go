@@ -156,9 +156,18 @@ func (m *tmuxManager) SendKeys(name, keys string, enter bool) error {
 	return nil
 }
 
-// CapturePane captures the current pane content from a session.
-func (m *tmuxManager) CapturePane(name string) (string, error) {
-	out, err := exec.Command("tmux", m.tmuxArgs("capture-pane", "-t", name, "-p", "-S", "-")...).Output()
+// CapturePane returns a session's pane content. historyLines <= 0 captures just
+// the VISIBLE pane (the current screen — prompt + recent output); >0 additionally
+// includes that many lines of scrollback above the screen. It deliberately does
+// NOT default to the full history (-S -): on a session with a large scrollback
+// that buried the current prompt under thousands of stale lines, so the caller
+// could never see the present state.
+func (m *tmuxManager) CapturePane(name string, historyLines int) (string, error) {
+	args := []string{"capture-pane", "-t", name, "-p"}
+	if historyLines > 0 {
+		args = append(args, "-S", "-"+strconv.Itoa(historyLines))
+	}
+	out, err := exec.Command("tmux", m.tmuxArgs(args...)...).Output()
 	if err != nil {
 		return "", fmt.Errorf("failed to capture pane from tmux session %s: %w", name, err)
 	}
@@ -179,7 +188,7 @@ func (m *tmuxManager) RunCommand(name, command string, enter bool, timeoutSec in
 	}
 	if !enter {
 		time.Sleep(300 * time.Millisecond)
-		return m.CapturePane(name)
+		return m.CapturePane(name, 0)
 	}
 	if err := m.sendEnter(name); err != nil {
 		return "", err
@@ -203,19 +212,25 @@ func (m *tmuxManager) RunCommand(name, command string, enter bool, timeoutSec in
 
 	deadline := time.Now().Add(timeout)
 	const pollInterval = 300 * time.Millisecond
+	// Detect completion on the visible pane (the sentinel is the last thing
+	// printed, so it lands at the bottom). Once found — or on timeout — grab a
+	// bounded slice of history so output that scrolled off-screen is still
+	// returned, without dumping the entire scrollback.
 	for {
 		time.Sleep(pollInterval)
-		pane, err := m.CapturePane(name)
+		pane, err := m.CapturePane(name, 0)
 		if err != nil {
 			return "", err
 		}
-		if loc := doneRe.FindStringSubmatchIndex(pane); loc != nil {
-			exitCode := pane[loc[2]:loc[3]]
-			return trimRunOutput(pane, marker, exitCode, false), nil
+		if doneRe.MatchString(pane) {
+			full, _ := m.CapturePane(name, 400)
+			loc := doneRe.FindStringSubmatchIndex(full)
+			exitCode := full[loc[2]:loc[3]]
+			return trimRunOutput(full, marker, exitCode, false), nil
 		}
 		if time.Now().After(deadline) {
-			pane, _ := m.CapturePane(name)
-			return trimRunOutput(pane, marker, "", true), nil
+			full, _ := m.CapturePane(name, 400)
+			return trimRunOutput(full, marker, "", true), nil
 		}
 	}
 }
@@ -363,12 +378,15 @@ func (t *tmuxTools) resolveName(a map[string]interface{}) (string, error) {
 }
 
 // truncate caps output at maxLen runes with a dropped-count note.
+// tmuxTruncate keeps the LAST maxLen chars. Terminal output is read tail-first —
+// the current prompt and a command's result are at the end, so truncating the
+// head (as this once did) discarded exactly what the caller needed to see.
 func tmuxTruncate(s string, maxLen int) string {
 	r := []rune(s)
 	if len(r) <= maxLen {
 		return s
 	}
-	return string(r[:maxLen]) + "\n\n... (truncated, " + strconv.Itoa(len(r)-maxLen) + " more chars)"
+	return "... (truncated, " + strconv.Itoa(len(r)-maxLen) + " earlier chars)\n\n" + string(r[len(r)-maxLen:])
 }
 
 func (t *tmuxTools) register(r *Registry) {
@@ -424,9 +442,13 @@ func (t *tmuxTools) register(r *Registry) {
 	})
 	r.Register(&Tool{
 		Name:        "capture_pane",
-		Description: "Capture the content of a tmux session's pane.",
+		Description: "Capture a tmux session's pane. By default returns the VISIBLE screen (current prompt + recent output). Set 'lines' to also include that many lines of scrollback above the screen.",
 		Schema: obj(map[string]interface{}{
 			"name": strProp("Name of the tmux session. Optional; defaults to the active session. Providing it makes that session active."),
+			"lines": map[string]interface{}{
+				"type":        "integer",
+				"description": "Extra scrollback lines to include above the visible screen (default 0 = visible pane only). Use e.g. 200 to see more history.",
+			},
 		}),
 		ReadOnly: true,
 		Handler:  t.capturePane,
@@ -578,7 +600,7 @@ func (t *tmuxTools) capturePane(ctx context.Context, a map[string]interface{}) (
 	if err != nil {
 		return "", err
 	}
-	output, err := t.mgr.CapturePane(name)
+	output, err := t.mgr.CapturePane(name, argInt(a, "lines", 0))
 	if err != nil {
 		return "", fmt.Errorf("capturing pane: %w", err)
 	}
