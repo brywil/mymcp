@@ -23,6 +23,16 @@ import (
 type fsTools struct {
 	root     string
 	llamaURL string
+	cache    string // base dir for generated scratch (images); falls back to root
+}
+
+// imagesDir is where analyze_image saves copies and list_images looks. Uses the
+// cache dir when set so generated images don't clutter the (whole-home) root.
+func (f *fsTools) imagesDir() string {
+	if f.cache != "" {
+		return filepath.Join(f.cache, "images")
+	}
+	return filepath.Join(f.root, "images")
 }
 
 // resolve validates that path stays within root even after symlinks are
@@ -647,7 +657,7 @@ func (f *fsTools) renameFile(_ context.Context, a map[string]interface{}) (strin
 }
 
 func (f *fsTools) listImages(_ context.Context, a map[string]interface{}) (string, error) {
-	imagesDir := filepath.Join(f.root, "images")
+	imagesDir := f.imagesDir()
 	entries, err := os.ReadDir(imagesDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -710,25 +720,21 @@ func (f *fsTools) analyzeImage(ctx context.Context, a map[string]interface{}) (s
 	}
 	dataURL := fmt.Sprintf("data:%s;base64,%s", mimeType, base64.StdEncoding.EncodeToString(data))
 
-	// Save a copy to workspace/images/ with a timestamped filename.
-	imagesDir := filepath.Join(f.root, "images")
+	// Save a timestamped copy to the images dir.
+	imagesDir := f.imagesDir()
 	_ = os.MkdirAll(imagesDir, 0755)
 	baseName := filepath.Base(path)
 	nameWithoutExt := strings.TrimSuffix(baseName, ext)
 	savedName := fmt.Sprintf("%s_%s%s", nameWithoutExt, time.Now().Format("20060102-150405"), ext)
 	savedPath := filepath.Join(imagesDir, savedName)
 	_ = os.WriteFile(savedPath, data, 0644)
-	relPath, err := filepath.Rel(f.root, savedPath)
-	if err != nil {
-		relPath = savedPath
-	}
 
 	if f.llamaURL != "" {
 		description, err := f.visionAnalyze(ctx, dataURL, prompt)
 		if err != nil {
 			return "", fmt.Errorf("analyzing image: %w", err)
 		}
-		return fmt.Sprintf("%s\n\nSaved to: workspace/images/%s", description, relPath), nil
+		return fmt.Sprintf("%s\n\nSaved to %s (see list_images)", description, savedPath), nil
 	}
 	// Fallback: return the base64 data URL.
 	return dataURL, nil

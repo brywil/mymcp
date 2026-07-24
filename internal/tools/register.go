@@ -12,6 +12,7 @@ type Config struct {
 	LlamaModel  string        // model id reported by model_info
 	TmuxSocket  string        // tmux socket path (-S); "" uses the default tmux server
 	MemoryDir   string        // base dir for namespaced memory (<MemoryDir>/<principal>/); "" falls back to Workspace
+	CacheDir    string        // base dir for generated scratch (web_cache, images); "" falls back to Workspace
 }
 
 // RegisterAll registers the full tool catalog into r per cfg.
@@ -30,7 +31,7 @@ func RegisterAll(r *Registry, cfg Config) {
 	}
 
 	// Always-on, dependency-light groups.
-	(&fsTools{root: cfg.Workspace, llamaURL: cfg.LlamaURL}).register(r)
+	(&fsTools{root: cfg.Workspace, llamaURL: cfg.LlamaURL, cache: cfg.CacheDir}).register(r)
 	(&sysTools{root: cfg.Workspace}).register(r)
 	(&miscTools{llamaURL: cfg.LlamaURL, llamaModel: cfg.LlamaModel}).register(r)
 	memBase := cfg.MemoryDir
@@ -39,7 +40,7 @@ func RegisterAll(r *Registry, cfg Config) {
 	}
 	(&memoryTools{base: memBase}).register(r)
 	(&httpTools{timeout: cfg.HTTPTimeout}).register(r)
-	(&webSearchTools{root: cfg.Workspace}).register(r)
+	(&webSearchTools{root: cfg.Workspace, cache: cfg.CacheDir}).register(r)
 
 	// Shell-backed groups gated behind AllowExec.
 	if cfg.AllowExec {

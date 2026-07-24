@@ -94,6 +94,7 @@ func runServe(args []string) error {
 	llamaModel := fs.String("llama-model", "", "model id reported by model_info")
 	tmuxSocket := fs.String("tmux-socket", "", "tmux socket path (-S); empty uses the default tmux server")
 	memoryDir := fs.String("memory-dir", "", "base dir for per-agent memory (<memory-dir>/<token-name>/); empty uses --workspace")
+	cacheDir := fs.String("cache-dir", "", "base dir for generated scratch (web_cache, images); empty uses the OS cache dir (~/.cache/mymcp)")
 	noAuth := fs.Bool("no-auth", false, "disable bearer auth (open server; loopback only)")
 	allowRemote := fs.Bool("allow-remote", false, "permit binding a non-loopback address")
 	_ = fs.Parse(args)
@@ -101,6 +102,14 @@ func runServe(args []string) error {
 	ws, err := filepath.Abs(*workspace)
 	if err != nil {
 		return err
+	}
+	// Default the scratch/cache dir to the OS cache location so generated files
+	// (web_cache, images) never land in a whole-home workspace root.
+	cache := *cacheDir
+	if cache == "" {
+		if ucd, err := os.UserCacheDir(); err == nil {
+			cache = filepath.Join(ucd, "mymcp")
+		}
 	}
 	host, _, err := net.SplitHostPort(*addr)
 	if err != nil {
@@ -136,6 +145,7 @@ func runServe(args []string) error {
 		LlamaModel:  *llamaModel,
 		TmuxSocket:  *tmuxSocket,
 		MemoryDir:   *memoryDir,
+		CacheDir:    cache,
 	})
 	srv := mcp.NewServer(mcp.Options{Tools: reg, Authenticate: authenticate, ServerName: "mymcp", Version: version})
 

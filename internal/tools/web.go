@@ -1209,8 +1209,9 @@ type ollamaWebFetchResult struct {
 
 // webSearchTools provides web search/fetch tools backed by Ollama's API.
 type webSearchTools struct {
-	root string // workspace dir; holds .env (OLLAMA_API_KEY) and web_cache
-	mu   sync.Mutex
+	root  string // workspace dir; .env fallback for OLLAMA_API_KEY
+	cache string // base dir for web_cache; falls back to root
+	mu    sync.Mutex
 }
 
 func (ws *webSearchTools) register(r *Registry) {
@@ -1270,6 +1271,9 @@ func (ws *webSearchTools) readEnvKey(key string) string {
 }
 
 func (ws *webSearchTools) cacheDir() string {
+	if ws.cache != "" {
+		return filepath.Join(ws.cache, "web_cache")
+	}
 	if ws.root == "" {
 		return ""
 	}

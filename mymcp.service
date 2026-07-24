@@ -16,7 +16,7 @@ EnvironmentFile=%h/.config/mymcp/mymcp.env
 # LLAMA_URL/LLAMA_MODEL power analyze_image + model_info; TMUX_SOCKET must match
 # the client's tmux server (goclaw uses /tmp/tmux-goclaw). Unset vars expand
 # empty, which the = form tolerates.
-ExecStart=%h/.local/bin/mymcp serve --addr ${ADDR} --workspace ${WORKSPACE} --llama-url=${LLAMA_URL} --llama-model=${LLAMA_MODEL} --tmux-socket=${TMUX_SOCKET} --memory-dir=${MEMORY_DIR}
+ExecStart=%h/.local/bin/mymcp serve --addr ${ADDR} --workspace ${WORKSPACE} --llama-url=${LLAMA_URL} --llama-model=${LLAMA_MODEL} --tmux-socket=${TMUX_SOCKET} --memory-dir=${MEMORY_DIR} --cache-dir=${CACHE_DIR}
 Restart=on-failure
 RestartSec=2
 
