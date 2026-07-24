@@ -1,14 +1,10 @@
 package tools
 
 import (
-	"bytes"
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,12 +14,10 @@ import (
 
 // fsTools provides filesystem access confined to a workspace root, ported from
 // goclaw's FileTool. All operations resolve paths within root (following
-// symlinks) and reject escapes. llamaURL points at an OpenAI-compatible vision
-// endpoint used by analyze_image.
+// symlinks) and reject escapes.
 type fsTools struct {
-	root     string
-	llamaURL string
-	cache    string // base dir for generated scratch (images); falls back to root
+	root  string
+	cache string // base dir for generated scratch (images); falls back to root
 }
 
 // imagesDir is where analyze_image saves copies and list_images looks. Uses the
@@ -204,15 +198,8 @@ func (f *fsTools) register(r *Registry) {
 		}, "old_path", "new_path"),
 		Handler: f.renameFile,
 	})
-	r.Register(&Tool{
-		Name:        "analyze_image",
-		Description: "Analyze an image with the multimodal model. Saves a copy to workspace/images/.",
-		Schema: obj(map[string]interface{}{
-			"path":   strProp("Path to the image file to analyze (relative or absolute). Images are automatically saved to workspace/images/ with a timestamped filename. Use 'list_images' to see all saved images."),
-			"prompt": strProp("Prompt describing what to look for in the image (default: 'Describe this image in detail.')"),
-		}, "path"),
-		Handler: f.analyzeImage,
-	})
+	// analyze_image intentionally lives in goclaw, not here: the vision call must
+	// hit goclaw's active backend (which /model repoints at runtime).
 	r.Register(&Tool{
 		Name:        "list_images",
 		Description: "List all images saved in workspace/images/.",
@@ -679,117 +666,6 @@ func (f *fsTools) listImages(_ context.Context, a map[string]interface{}) (strin
 		lines = append(lines, fmt.Sprintf("%8s  %s", formatSize(info.Size()), name))
 	}
 	return fmt.Sprintf("Saved images (%d):\n%s", len(entries), strings.Join(lines, "\n")), nil
-}
-
-func (f *fsTools) analyzeImage(ctx context.Context, a map[string]interface{}) (string, error) {
-	path := argString(a, "path")
-	if path == "" {
-		return "", errors.New("path is required and must be a string")
-	}
-	prompt := argString(a, "prompt")
-	if prompt == "" {
-		prompt = "Describe this image in detail."
-	}
-	resolved, err := f.resolve(path)
-	if err != nil {
-		return "", err
-	}
-	info, err := os.Stat(resolved)
-	if err != nil {
-		return "", err
-	}
-	if info.IsDir() {
-		return "", fmt.Errorf("%s is a directory, not an image", path)
-	}
-	data, err := os.ReadFile(resolved)
-	if err != nil {
-		return "", fmt.Errorf("reading file: %w", err)
-	}
-
-	mimeType := "image/jpeg"
-	ext := strings.ToLower(filepath.Ext(path))
-	switch ext {
-	case ".png":
-		mimeType = "image/png"
-	case ".webp":
-		mimeType = "image/webp"
-	case ".bmp":
-		mimeType = "image/bmp"
-	case ".gif":
-		mimeType = "image/gif"
-	}
-	dataURL := fmt.Sprintf("data:%s;base64,%s", mimeType, base64.StdEncoding.EncodeToString(data))
-
-	// Save a timestamped copy to the images dir.
-	imagesDir := f.imagesDir()
-	_ = os.MkdirAll(imagesDir, 0755)
-	baseName := filepath.Base(path)
-	nameWithoutExt := strings.TrimSuffix(baseName, ext)
-	savedName := fmt.Sprintf("%s_%s%s", nameWithoutExt, time.Now().Format("20060102-150405"), ext)
-	savedPath := filepath.Join(imagesDir, savedName)
-	_ = os.WriteFile(savedPath, data, 0644)
-
-	if f.llamaURL != "" {
-		description, err := f.visionAnalyze(ctx, dataURL, prompt)
-		if err != nil {
-			return "", fmt.Errorf("analyzing image: %w", err)
-		}
-		return fmt.Sprintf("%s\n\nSaved to %s (see list_images)", description, savedPath), nil
-	}
-	// Fallback: return the base64 data URL.
-	return dataURL, nil
-}
-
-// visionAnalyze sends an image data URL and prompt to the OpenAI-compatible
-// chat/completions endpoint at llamaURL and returns the model's text response.
-// Mirrors llama.Client.AnalyzeImage.
-func (f *fsTools) visionAnalyze(ctx context.Context, imageDataURL, prompt string) (string, error) {
-	reqBody := map[string]interface{}{
-		"stream":     false,
-		"max_tokens": 1024,
-		"messages": []interface{}{
-			map[string]interface{}{
-				"role": "user",
-				"content": []interface{}{
-					map[string]interface{}{"type": "text", "text": prompt},
-					map[string]interface{}{"type": "image_url", "image_url": map[string]interface{}{"url": imageDataURL}},
-				},
-			},
-		},
-	}
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", fmt.Errorf("marshaling request: %w", err)
-	}
-	req, err := http.NewRequestWithContext(ctx, "POST", f.llamaURL+"/chat/completions", bytes.NewReader(body))
-	if err != nil {
-		return "", fmt.Errorf("creating request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 600 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("sending request: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("llama.cpp API error (status %d): %s", resp.StatusCode, string(respBody))
-	}
-	var result struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", fmt.Errorf("decoding response: %w", err)
-	}
-	if len(result.Choices) == 0 {
-		return "", errors.New("empty response from llama.cpp")
-	}
-	return result.Choices[0].Message.Content, nil
 }
 
 // copyPath copies src to dst, recursing into directories and preserving file

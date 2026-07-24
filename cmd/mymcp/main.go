@@ -90,9 +90,10 @@ func runServe(args []string) error {
 	addr := fs.String("addr", "127.0.0.1:9443", "listen address (loopback only unless --allow-remote)")
 	workspace := fs.String("workspace", ".", "root directory the filesystem tools are confined to")
 	allowExec := fs.Bool("allow-exec", true, "enable shell-backed tools (run_command, git, gh, tmux)")
-	llamaURL := fs.String("llama-url", "", "OpenAI-compatible base URL for analyze_image")
-	// Deprecated: model_info moved to goclaw (it must follow goclaw's runtime
-	// backend switches). Flag still accepted so existing unit files don't break.
+	// Deprecated: analyze_image and model_info both moved to goclaw (they must
+	// follow goclaw's runtime backend switches). Flags still accepted so existing
+	// unit files don't break, but ignored.
+	_ = fs.String("llama-url", "", "deprecated: unused (analyze_image now lives in goclaw)")
 	_ = fs.String("llama-model", "", "deprecated: unused (model_info now lives in goclaw)")
 	tmuxSocket := fs.String("tmux-socket", "", "tmux socket path (-S); empty uses the default tmux server")
 	memoryDir := fs.String("memory-dir", "", "base dir for per-agent memory (<memory-dir>/<token-name>/); empty uses --workspace")
@@ -143,7 +144,6 @@ func runServe(args []string) error {
 		Workspace:   ws,
 		AllowExec:   *allowExec,
 		ExecTimeout: 120 * time.Second,
-		LlamaURL:    *llamaURL,
 		TmuxSocket:  *tmuxSocket,
 		MemoryDir:   *memoryDir,
 		CacheDir:    cache,

@@ -8,7 +8,6 @@ type Config struct {
 	AllowExec   bool          // enable shell-backed tools (git, gh, tmux/run_command)
 	ExecTimeout time.Duration // per-command timeout (default 120s)
 	HTTPTimeout time.Duration // per-request timeout for http/web tools (default 30s)
-	LlamaURL    string        // OpenAI-compatible base URL for analyze_image
 	TmuxSocket  string        // tmux socket path (-S); "" uses the default tmux server
 	MemoryDir   string        // base dir for namespaced memory (<MemoryDir>/<principal>/); "" falls back to Workspace
 	CacheDir    string        // base dir for generated scratch (web_cache, images); "" falls back to Workspace
@@ -30,7 +29,7 @@ func RegisterAll(r *Registry, cfg Config) {
 	}
 
 	// Always-on, dependency-light groups.
-	(&fsTools{root: cfg.Workspace, llamaURL: cfg.LlamaURL, cache: cfg.CacheDir}).register(r)
+	(&fsTools{root: cfg.Workspace, cache: cfg.CacheDir}).register(r)
 	(&sysTools{root: cfg.Workspace}).register(r)
 	(&miscTools{}).register(r)
 	memBase := cfg.MemoryDir
