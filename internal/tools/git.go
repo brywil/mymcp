@@ -111,7 +111,7 @@ func (g *gitTools) gitRun(ctx context.Context, repo string, args ...string) (str
 func (g *gitTools) getRepoPath(a map[string]interface{}) (string, error) {
 	repo := argString(a, "repo_path")
 	if repo == "" {
-		return "", fmt.Errorf("repo_path is required — specify the path to the git repository (e.g., /home/bryan/src/openclaw-go)")
+		return "", fmt.Errorf("repo_path is required — specify the path to the git repository (e.g., /path/to/repo)")
 	}
 	if !filepath.IsAbs(repo) && g.root != "" {
 		repo = filepath.Join(g.root, repo)
@@ -501,7 +501,7 @@ func (g *gitTools) sshKeyList(ctx context.Context, _ map[string]interface{}) (st
 
 // --- schemas (mirror goclaw's Git*Schema exactly) ---
 
-const repoPathDesc = "Path to the git repository. Must be specified — can be absolute (e.g., /home/bryan/src/openclaw-go) or relative to the current working directory."
+const repoPathDesc = "Path to the git repository. Must be specified — can be absolute (e.g., /path/to/repo) or relative to the current working directory."
 
 func gitEmptySchema() map[string]interface{} {
 	return map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}

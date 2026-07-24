@@ -56,7 +56,7 @@ func (g *ghTools) ghRun(ctx context.Context, repo string, args ...string) (strin
 func (g *ghTools) getRepoPath(args map[string]interface{}) (string, error) {
 	repo := argString(args, "repo_path")
 	if repo == "" {
-		return "", fmt.Errorf("repo_path is required — specify the path to the git repository (e.g., /home/bryan/src/openclaw-go)")
+		return "", fmt.Errorf("repo_path is required — specify the path to the git repository (e.g., /path/to/repo)")
 	}
 	if !filepath.IsAbs(repo) && g.root != "" {
 		repo = filepath.Join(g.root, repo)
@@ -336,7 +336,7 @@ func (g *ghTools) repoView(ctx context.Context, a map[string]interface{}) (strin
 
 // --- schemas (faithful to goclaw's gh_tools.go) ---
 
-var ghRepoPathProp = strProp("Path to the git repository. Must be specified — can be absolute (e.g., /home/bryan/src/openclaw-go) or relative to the current working directory.")
+var ghRepoPathProp = strProp("Path to the git repository. Must be specified — can be absolute (e.g., /path/to/repo) or relative to the current working directory.")
 
 var prListSchema = obj(map[string]interface{}{
 	"repo_path": ghRepoPathProp,
