@@ -2,13 +2,9 @@ package tools
 
 import (
 	"bufio"
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -786,12 +782,8 @@ func matchGlobParts(pparts []string, pi int, parts []string, si int) bool {
 // miscTools: date, system status, sleep, and model info.
 // -----------------------------------------------------------------------------
 
-// miscTools provides host/date/model utilities. model_info queries the llama
-// server at llamaURL.
-type miscTools struct {
-	llamaURL   string
-	llamaModel string
-}
+// miscTools provides host/date/time utilities.
+type miscTools struct{}
 
 func (m *miscTools) register(r *Registry) {
 	r.Register(&Tool{
@@ -813,18 +805,8 @@ func (m *miscTools) register(r *Registry) {
 		ReadOnly:    true,
 		Handler:     m.sleep,
 	})
-	r.Register(&Tool{
-		Name:        "model_info",
-		Description: "Report details about the model you (the bot) are currently running on, pulled live from the llama.cpp server: model name/path, context window, slots, build, modalities, and default sampling settings. Use this when asked about your own model, context size, or capabilities.",
-		Schema: map[string]interface{}{
-			"type": "object",
-			"properties": map[string]interface{}{
-				"raw": map[string]interface{}{"type": "boolean", "description": "If true, return the full raw /props JSON from the server instead of the summary."},
-			},
-		},
-		ReadOnly: true,
-		Handler:  m.modelInfo,
-	})
+	// model_info intentionally lives in goclaw, not here: it must follow goclaw's
+	// runtime /model backend switches, and only goclaw knows the active backend.
 }
 
 func localESTNow() time.Time {
@@ -928,159 +910,6 @@ func (m *miscTools) sleep(_ context.Context, args map[string]interface{}) (strin
 	time.Sleep(time.Duration(seconds*1000) * time.Millisecond)
 	elapsed := time.Since(start)
 	return fmt.Sprintf("Slept for %.1f seconds (requested: %.1f)", elapsed.Seconds(), seconds), nil
-}
-
-type llamaProps struct {
-	ModelPath                 string          `json:"model_path"`
-	ModelAlias                string          `json:"model_alias"`
-	TotalSlots                int             `json:"total_slots"`
-	BuildInfo                 string          `json:"build_info"`
-	Modalities                map[string]bool `json:"modalities"`
-	BOSToken                  string          `json:"bos_token"`
-	EOSToken                  string          `json:"eos_token"`
-	IsSleeping                bool            `json:"is_sleeping"`
-	DefaultGenerationSettings struct {
-		NCtx   int                    `json:"n_ctx"`
-		Params map[string]interface{} `json:"params"`
-	} `json:"default_generation_settings"`
-}
-
-// llamaRoot returns the server root (base URL without a trailing /v1).
-func (m *miscTools) llamaRoot() string {
-	r := strings.TrimRight(m.llamaURL, "/")
-	r = strings.TrimSuffix(r, "/v1")
-	return strings.TrimRight(r, "/")
-}
-
-func (m *miscTools) modelInfo(ctx context.Context, args map[string]interface{}) (string, error) {
-	client := &http.Client{Timeout: 8 * time.Second}
-	root := m.llamaRoot()
-
-	status := "unknown"
-	if req, err := http.NewRequestWithContext(ctx, http.MethodGet, root+"/health", nil); err == nil {
-		if resp, err := client.Do(req); err == nil {
-			var h struct {
-				Status string `json:"status"`
-			}
-			_ = json.NewDecoder(resp.Body).Decode(&h)
-			resp.Body.Close()
-			if h.Status != "" {
-				status = h.Status
-			}
-		}
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, root+"/props", nil)
-	if err != nil {
-		return "", err
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("querying llama server at %s (is it up?): %w", root, err)
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("reading /props: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("llama server /props returned HTTP %d", resp.StatusCode)
-	}
-
-	if argBool(args, "raw", false) {
-		var pretty bytes.Buffer
-		if json.Indent(&pretty, body, "", "  ") == nil {
-			return pretty.String(), nil
-		}
-		return string(body), nil
-	}
-
-	var p llamaProps
-	if err := json.Unmarshal(body, &p); err != nil {
-		return "", fmt.Errorf("decoding /props: %w", err)
-	}
-
-	name := p.ModelPath
-	if i := strings.LastIndex(name, "/"); i >= 0 {
-		name = name[i+1:]
-	}
-	name = strings.TrimSuffix(name, ".gguf")
-
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "Model: %s\n", name)
-	fmt.Fprintf(&sb, "Server: %s (status: %s, llama.cpp build %s)\n", root, status, p.BuildInfo)
-	fmt.Fprintf(&sb, "Full path: %s\n", p.ModelPath)
-	if p.DefaultGenerationSettings.NCtx > 0 {
-		fmt.Fprintf(&sb, "Context window: %s tokens\n", withThousands(p.DefaultGenerationSettings.NCtx))
-	}
-	fmt.Fprintf(&sb, "Slots: %d\n", p.TotalSlots)
-	if p.IsSleeping {
-		sb.WriteString("State: sleeping (idle, will wake on next request)\n")
-	}
-	if mods := enabledModalities(p.Modalities); len(mods) > 0 {
-		fmt.Fprintf(&sb, "Modalities: %s\n", strings.Join(mods, ", "))
-	}
-	if p.BOSToken != "" || p.EOSToken != "" {
-		fmt.Fprintf(&sb, "Tokens: bos=%q eos=%q\n", p.BOSToken, p.EOSToken)
-	}
-	if parts := pickSamplingParams(p.DefaultGenerationSettings.Params); len(parts) > 0 {
-		fmt.Fprintf(&sb, "Default sampling: %s\n", strings.Join(parts, ", "))
-	}
-	if m.llamaModel != "" {
-		fmt.Fprintf(&sb, "Model id (goclaw config): %s\n", m.llamaModel)
-	}
-	sb.WriteString("\n(Use raw=true for the full /props JSON.)")
-	return strings.TrimRight(sb.String(), "\n"), nil
-}
-
-func enabledModalities(mods map[string]bool) []string {
-	var out []string
-	for k, v := range mods {
-		if v {
-			out = append(out, k)
-		}
-	}
-	sort.Strings(out)
-	return out
-}
-
-func pickSamplingParams(params map[string]interface{}) []string {
-	if len(params) == 0 {
-		return nil
-	}
-	keys := []string{"temperature", "top_k", "top_p", "min_p", "repeat_penalty", "presence_penalty", "frequency_penalty"}
-	var parts []string
-	for _, k := range keys {
-		if v, ok := params[k]; ok {
-			parts = append(parts, k+"="+formatSamplingNum(v))
-		}
-	}
-	return parts
-}
-
-func formatSamplingNum(v interface{}) string {
-	if f, ok := v.(float64); ok {
-		if f == float64(int64(f)) {
-			return strconv.FormatInt(int64(f), 10)
-		}
-		return strconv.FormatFloat(f, 'g', 4, 64)
-	}
-	return fmt.Sprintf("%v", v)
-}
-
-func withThousands(n int) string {
-	s := strconv.Itoa(n)
-	if n < 0 {
-		return s
-	}
-	var out []byte
-	for i, c := range []byte(s) {
-		if i > 0 && (len(s)-i)%3 == 0 {
-			out = append(out, ',')
-		}
-		out = append(out, c)
-	}
-	return string(out)
 }
 
 // -----------------------------------------------------------------------------

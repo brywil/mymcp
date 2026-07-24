@@ -63,8 +63,8 @@ serve flags:
   --addr ADDR         listen address (default 127.0.0.1:9443; loopback only)
   --workspace DIR     root the filesystem tools are confined to (default .)
   --allow-exec        enable shell-backed tools: run_command, git, gh, tmux (default true)
-  --llama-url URL     OpenAI-compatible base URL for analyze_image + model_info
-  --llama-model ID    model id reported by model_info
+  --llama-url URL     OpenAI-compatible base URL for analyze_image
+  --llama-model ID    deprecated, ignored (model_info now lives in goclaw)
   --tmux-socket PATH  tmux socket (-S) for tmux tools; empty = default tmux server
   --no-auth           disable bearer auth entirely (open; loopback only)
   --allow-remote      permit a non-loopback bind (prefer fronting with truemtls)
@@ -90,8 +90,10 @@ func runServe(args []string) error {
 	addr := fs.String("addr", "127.0.0.1:9443", "listen address (loopback only unless --allow-remote)")
 	workspace := fs.String("workspace", ".", "root directory the filesystem tools are confined to")
 	allowExec := fs.Bool("allow-exec", true, "enable shell-backed tools (run_command, git, gh, tmux)")
-	llamaURL := fs.String("llama-url", "", "OpenAI-compatible base URL for analyze_image + model_info")
-	llamaModel := fs.String("llama-model", "", "model id reported by model_info")
+	llamaURL := fs.String("llama-url", "", "OpenAI-compatible base URL for analyze_image")
+	// Deprecated: model_info moved to goclaw (it must follow goclaw's runtime
+	// backend switches). Flag still accepted so existing unit files don't break.
+	_ = fs.String("llama-model", "", "deprecated: unused (model_info now lives in goclaw)")
 	tmuxSocket := fs.String("tmux-socket", "", "tmux socket path (-S); empty uses the default tmux server")
 	memoryDir := fs.String("memory-dir", "", "base dir for per-agent memory (<memory-dir>/<token-name>/); empty uses --workspace")
 	cacheDir := fs.String("cache-dir", "", "base dir for generated scratch (web_cache, images); empty uses the OS cache dir (~/.cache/mymcp)")
@@ -142,7 +144,6 @@ func runServe(args []string) error {
 		AllowExec:   *allowExec,
 		ExecTimeout: 120 * time.Second,
 		LlamaURL:    *llamaURL,
-		LlamaModel:  *llamaModel,
 		TmuxSocket:  *tmuxSocket,
 		MemoryDir:   *memoryDir,
 		CacheDir:    cache,
