@@ -44,6 +44,9 @@ func RegisterAll(r *Registry, cfg Config) {
 	// Shell-backed groups gated behind AllowExec.
 	if cfg.AllowExec {
 		(&ghTools{root: cfg.Workspace}).register(r)
+		// Read-only git. Development happens in opencode; this is for answering
+		// questions about a repo (including goclaw's own).
+		(&gitTools{root: cfg.Workspace}).register(r)
 		newTmuxTools(cfg.TmuxSocket).register(r)
 	}
 }
