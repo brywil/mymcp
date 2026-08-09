@@ -5,7 +5,7 @@ import "time"
 // Config controls which tools are registered and how they behave.
 type Config struct {
 	Workspace   string        // root that filesystem/exec tools are confined to
-	AllowExec   bool          // enable shell-backed tools (git, gh, tmux/run_command)
+	AllowExec   bool          // enable shell-backed tools (gh, tmux/run_command)
 	ExecTimeout time.Duration // per-command timeout (default 120s)
 	HTTPTimeout time.Duration // per-request timeout for http/web tools (default 30s)
 	TmuxSocket  string        // tmux socket path (-S); "" uses the default tmux server
@@ -43,7 +43,6 @@ func RegisterAll(r *Registry, cfg Config) {
 
 	// Shell-backed groups gated behind AllowExec.
 	if cfg.AllowExec {
-		(&gitTools{root: cfg.Workspace, timeout: cfg.ExecTimeout}).register(r)
 		(&ghTools{root: cfg.Workspace}).register(r)
 		newTmuxTools(cfg.TmuxSocket).register(r)
 	}
