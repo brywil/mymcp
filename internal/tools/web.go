@@ -1435,7 +1435,7 @@ var webSearchSchema = map[string]interface{}{
 		"mode": map[string]interface{}{
 			"type":        "string",
 			"description": "Output mode: 'small' (titles/URLs only), 'full' (titles/URLs/content snippets), 'raw' (raw JSON). Defaults to 'small'.",
-			"enum":        []string{"small", "full", "raw"},
+			"enum":        searchModes,
 		},
 	},
 	"required": []string{"query"},
@@ -1454,9 +1454,16 @@ func (ws *webSearchTools) webSearch(ctx context.Context, args map[string]interfa
 		}
 	}
 
+	// Validate rather than silently falling back. The schema declares an enum, so
+	// an unrecognised mode is a caller mistake — and answering mode="Full" with
+	// `small` output looks like "these pages have no content" to a model, costing
+	// a whole round trip on a slow local backend to discover otherwise.
 	mode := "small"
-	if m, ok := args["mode"].(string); ok {
-		mode = m
+	if m, ok := args["mode"].(string); ok && strings.TrimSpace(m) != "" {
+		mode = strings.ToLower(strings.TrimSpace(m))
+		if !validSearchMode(mode) {
+			return "", fmt.Errorf("unknown mode %q: expected one of %s", m, strings.Join(searchModes, ", "))
+		}
 	}
 
 	resp, err := ws.queryOllamaSearch(query, maxResults)
@@ -1470,6 +1477,27 @@ func (ws *webSearchTools) webSearch(ctx context.Context, args map[string]interfa
 
 	ws.cacheSearch(query, resp)
 
+	return formatSearchResults(query, resp, mode)
+}
+
+// searchModes is the single source of truth for the enum: the schema advertises
+// it and the handler validates against it, so the two cannot drift apart.
+var searchModes = []string{"small", "full", "raw"}
+
+func validSearchMode(mode string) bool {
+	for _, m := range searchModes {
+		if m == mode {
+			return true
+		}
+	}
+	return false
+}
+
+// formatSearchResults renders a response in the requested mode. Split out of
+// webSearch so the mode dispatch — the part that actually changed when the three
+// separate tools were consolidated — can be tested without an Ollama API key or
+// a network round trip.
+func formatSearchResults(query string, resp *ollamaWebSearchResponse, mode string) (string, error) {
 	switch mode {
 	case "raw":
 		rawJSON, err := json.MarshalIndent(resp, "", "  ")
