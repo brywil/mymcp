@@ -1186,8 +1186,7 @@ func truncate(s string, maxLen int) string {
 }
 
 // =============================================================================
-// webSearchTools: Ollama-backed web search + fetch (web_search_small,
-// web_search_full, web_search_raw, web_fetch). Ported from goclaw
+// webSearchTools: Ollama-backed web search + fetch (web_search, web_fetch). Ported from goclaw
 // internal/tools/web_search_tool.go. Results are cached under <root>/web_cache.
 // =============================================================================
 
