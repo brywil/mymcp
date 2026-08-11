@@ -788,7 +788,7 @@ type miscTools struct{}
 func (m *miscTools) register(r *Registry) {
 	r.Register(&Tool{
 		Name:        "date_now",
-		Description: "Get the current date and time in the user's local timezone (EST).",
+		Description: "Get the current date and time in the user's local timezone (US Eastern; EST or EDT depending on the date).",
 		ReadOnly:    true,
 		Handler:     m.dateNow,
 	})
@@ -815,7 +815,7 @@ func (m *miscTools) dateNow(_ context.Context, _ map[string]interface{}) (string
 	local := localESTNow()
 	return fmt.Sprintf("The current date and time is %s (%s)",
 		local.Format("Monday, January 2, 2006"),
-		local.Format("3:04 PM EST")), nil
+		local.Format("3:04 PM MST")), nil
 }
 
 func (m *miscTools) systemStatus(_ context.Context, _ map[string]interface{}) (string, error) {
@@ -823,7 +823,7 @@ func (m *miscTools) systemStatus(_ context.Context, _ map[string]interface{}) (s
 	local := localESTNow()
 	result := fmt.Sprintf("Current date and time: %s (%s)\n",
 		local.Format("Monday, January 2, 2006"),
-		local.Format("3:04 PM EST"))
+		local.Format("3:04 PM MST"))
 
 	uptimeSecs, bootTime, err := readSystemUptime()
 	if err != nil {
@@ -884,7 +884,6 @@ func humanizeTime(t time.Time) string {
 		return unit(int(d.Hours()/(24*365)), "year")
 	}
 }
-
 
 // -----------------------------------------------------------------------------
 // memoryTools: search/list of the workspace memory files.
