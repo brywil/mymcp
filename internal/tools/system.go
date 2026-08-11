@@ -801,6 +801,11 @@ func (m *miscTools) register(r *Registry) {
 	// sleep and model_info intentionally live in goclaw, not here: sleep drives a
 	// Telegram countdown, and model_info must follow goclaw's runtime /model
 	// backend switches. Keeping single implementations avoids drift.
+
+	// wait_for lives HERE rather than in goclaw so the shell scripts under
+	// models/apex-runs can use it too — wait_mem is currently copy-pasted into
+	// ten of them, which means fixing it means fixing it ten times.
+	m.registerWait(r)
 }
 
 func localESTNow() time.Time {
