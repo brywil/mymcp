@@ -1216,25 +1216,11 @@ type webSearchTools struct {
 
 func (ws *webSearchTools) register(r *Registry) {
 	r.Register(&Tool{
-		Name:        "web_search_small",
-		Description: "Search the web and return only titles and URLs (full content cached to disk).",
-		Schema:      webSearchSmallSchema,
+		Name:        "web_search",
+		Description: "Search the web via Ollama. Mode: 'small' returns titles/URLs only (cached), 'full' returns titles/URLs/content snippets, 'raw' returns raw JSON.",
+		Schema:      webSearchSchema,
 		ReadOnly:    true,
-		Handler:     ws.webSearchSmall,
-	})
-	r.Register(&Tool{
-		Name:        "web_search_full",
-		Description: "Search the web and return titles, URLs, and content snippets.",
-		Schema:      webSearchFullSchema,
-		ReadOnly:    true,
-		Handler:     ws.webSearchFull,
-	})
-	r.Register(&Tool{
-		Name:        "web_search_raw",
-		Description: "Search the web and return the raw JSON response from Ollama.",
-		Schema:      webSearchRawSchema,
-		ReadOnly:    true,
-		Handler:     ws.webSearchRaw,
+		Handler:     ws.webSearch,
 	})
 	r.Register(&Tool{
 		Name:        "web_fetch",
@@ -1436,7 +1422,7 @@ func (ws *webSearchTools) cacheSearch(query string, resp *ollamaWebSearchRespons
 	}
 }
 
-var webSearchSmallSchema = map[string]interface{}{
+var webSearchSchema = map[string]interface{}{
 	"type": "object",
 	"properties": map[string]interface{}{
 		"query": map[string]interface{}{
@@ -1447,11 +1433,16 @@ var webSearchSmallSchema = map[string]interface{}{
 			"type":        "integer",
 			"description": "Maximum number of results to return (1-10, default 5)",
 		},
+		"mode": map[string]interface{}{
+			"type":        "string",
+			"description": "Output mode: 'small' (titles/URLs only), 'full' (titles/URLs/content snippets), 'raw' (raw JSON). Defaults to 'small'.",
+			"enum":        []string{"small", "full", "raw"},
+		},
 	},
 	"required": []string{"query"},
 }
 
-func (ws *webSearchTools) webSearchSmall(ctx context.Context, args map[string]interface{}) (string, error) {
+func (ws *webSearchTools) webSearch(ctx context.Context, args map[string]interface{}) (string, error) {
 	query, ok := args["query"].(string)
 	if !ok || query == "" {
 		return "", fmt.Errorf("query is required and must be a non-empty string")
@@ -1462,6 +1453,11 @@ func (ws *webSearchTools) webSearchSmall(ctx context.Context, args map[string]in
 		if mr >= 1 && mr <= 10 {
 			maxResults = int(mr)
 		}
+	}
+
+	mode := "small"
+	if m, ok := args["mode"].(string); ok {
+		mode = m
 	}
 
 	resp, err := ws.queryOllamaSearch(query, maxResults)
@@ -1475,111 +1471,33 @@ func (ws *webSearchTools) webSearchSmall(ctx context.Context, args map[string]in
 
 	ws.cacheSearch(query, resp)
 
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("=== Search Results: %s (%d results) ===\n\n", query, len(resp.Results)))
-	for i, r := range resp.Results {
-		sb.WriteString(fmt.Sprintf("%d. %s\n   %s\n\n", i+1, r.Title, r.URL))
-	}
-	sb.WriteString("Full results cached to disk. Use web_search_full to get content snippets.\n")
-
-	return sb.String(), nil
-}
-
-var webSearchFullSchema = map[string]interface{}{
-	"type": "object",
-	"properties": map[string]interface{}{
-		"query": map[string]interface{}{
-			"type":        "string",
-			"description": "The search query string",
-		},
-		"max_results": map[string]interface{}{
-			"type":        "integer",
-			"description": "Maximum number of results to return (1-10, default 5)",
-		},
-	},
-	"required": []string{"query"},
-}
-
-func (ws *webSearchTools) webSearchFull(ctx context.Context, args map[string]interface{}) (string, error) {
-	query, ok := args["query"].(string)
-	if !ok || query == "" {
-		return "", fmt.Errorf("query is required and must be a non-empty string")
-	}
-
-	maxResults := 5
-	if mr, ok := args["max_results"].(float64); ok {
-		if mr >= 1 && mr <= 10 {
-			maxResults = int(mr)
+	switch mode {
+	case "raw":
+		rawJSON, err := json.MarshalIndent(resp, "", "  ")
+		if err != nil {
+			return "", fmt.Errorf("formatting response: %s", err.Error())
 		}
-	}
+		return string(rawJSON), nil
 
-	resp, err := ws.queryOllamaSearch(query, maxResults)
-	if err != nil {
-		return "", fmt.Errorf("search failed: %s", err.Error())
-	}
-
-	if len(resp.Results) == 0 {
-		return fmt.Sprintf("No results found for: %s", query), nil
-	}
-
-	ws.cacheSearch(query, resp)
-
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("=== Search Results: %s (%d results) ===\n\n", query, len(resp.Results)))
-	for i, r := range resp.Results {
-		sb.WriteString(fmt.Sprintf("--- %d. %s ---\n", i+1, r.Title))
-		sb.WriteString(fmt.Sprintf("URL: %s\n", r.URL))
-		sb.WriteString(fmt.Sprintf("Content: %s\n\n", r.Content))
-	}
-
-	return sb.String(), nil
-}
-
-var webSearchRawSchema = map[string]interface{}{
-	"type": "object",
-	"properties": map[string]interface{}{
-		"query": map[string]interface{}{
-			"type":        "string",
-			"description": "The search query string",
-		},
-		"max_results": map[string]interface{}{
-			"type":        "integer",
-			"description": "Maximum number of results to return (1-10, default 5)",
-		},
-	},
-	"required": []string{"query"},
-}
-
-func (ws *webSearchTools) webSearchRaw(ctx context.Context, args map[string]interface{}) (string, error) {
-	query, ok := args["query"].(string)
-	if !ok || query == "" {
-		return "", fmt.Errorf("query is required and must be a non-empty string")
-	}
-
-	maxResults := 5
-	if mr, ok := args["max_results"].(float64); ok {
-		if mr >= 1 && mr <= 10 {
-			maxResults = int(mr)
+	case "full":
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("=== Search Results: %s (%d results) ===\n\n", query, len(resp.Results)))
+		for i, r := range resp.Results {
+			sb.WriteString(fmt.Sprintf("--- %d. %s ---\n", i+1, r.Title))
+			sb.WriteString(fmt.Sprintf("URL: %s\n", r.URL))
+			sb.WriteString(fmt.Sprintf("Content: %s\n\n", r.Content))
 		}
+		return sb.String(), nil
+
+	default: // small
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("=== Search Results: %s (%d results) ===\n\n", query, len(resp.Results)))
+		for i, r := range resp.Results {
+			sb.WriteString(fmt.Sprintf("%d. %s\n   %s\n\n", i+1, r.Title, r.URL))
+		}
+		sb.WriteString("Full results cached to disk. Use mode='full' to get content snippets.\n")
+		return sb.String(), nil
 	}
-
-	resp, err := ws.queryOllamaSearch(query, maxResults)
-	if err != nil {
-		return "", fmt.Errorf("search failed: %s", err.Error())
-	}
-
-	if len(resp.Results) == 0 {
-		return fmt.Sprintf("No results found for: %s", query), nil
-	}
-
-	ws.cacheSearch(query, resp)
-
-	rawJSON, err := json.MarshalIndent(resp, "", "  ")
-	if err != nil {
-		return "", fmt.Errorf("formatting response: %s", err.Error())
-	}
-
-	return string(rawJSON), nil
 }
 
 var webFetchSchema = map[string]interface{}{
