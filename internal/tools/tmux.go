@@ -83,7 +83,14 @@ func (m *tmuxManager) CreateSession(name, dir, command string) (*tmuxSession, er
 		return nil, fmt.Errorf("tmux session '%s' already exists", name)
 	}
 
-	args := m.tmuxArgs("new-session", "-d", "-s", name, "-c", dir)
+	// Omit -c entirely when no dir is given: `-c ""` makes tmux fail with
+	// "can't find directory". Harmless while every caller passed a dir, but
+	// resolveName now creates a session with no opinion about where it starts.
+	newArgs := []string{"new-session", "-d", "-s", name}
+	if dir != "" {
+		newArgs = append(newArgs, "-c", dir)
+	}
+	args := m.tmuxArgs(newArgs...)
 	out, err := exec.Command("tmux", args...).CombinedOutput()
 	if err != nil {
 		msg := strings.TrimSpace(string(out))
@@ -364,8 +371,29 @@ func (t *tmuxTools) clearActiveIf(name string) {
 	t.mu.Unlock()
 }
 
-// resolveName returns the session to operate on. A non-empty "name" is used and
-// becomes active; otherwise the current active session is used.
+// defaultSessionName is the session created on demand when a caller runs
+// something without having set one up.
+const defaultSessionName = "goclaw"
+
+// resolveName returns the session to operate on, creating one if necessary.
+//
+// It used to fail with "no session specified and no active session set; create a
+// session or set one active first" — an error stating a precondition without
+// naming the tool that satisfies it. An agent that hit it had to go find
+// list_sessions, choose, and retry; in practice one instead dropped to the
+// lower-level send_keys (which returns no output) and then had to capture the
+// pane to discover what had happened. Three extra round trips for a missing
+// default.
+//
+// Resolution order, each step more presumptuous than the last:
+//  1. an explicit name (which also becomes active)
+//  2. the active session
+//  3. the only existing session, when there is exactly one — unambiguous
+//  4. otherwise create the default session and use it
+//
+// Step 3 deliberately stops short of guessing when several sessions exist:
+// picking one arbitrarily could type a command into a session the user is
+// watching, so that case names them and asks.
 func (t *tmuxTools) resolveName(a map[string]interface{}) (string, error) {
 	if name := argString(a, "name"); name != "" {
 		t.setActive(name)
@@ -374,7 +402,28 @@ func (t *tmuxTools) resolveName(a map[string]interface{}) (string, error) {
 	if active := t.getActive(); active != "" {
 		return active, nil
 	}
-	return "", fmt.Errorf("no session specified and no active session set; create a session or set one active first")
+
+	sessions, err := t.mgr.ListSessions()
+	if err == nil && len(sessions) == 1 {
+		t.setActive(sessions[0].Name)
+		return sessions[0].Name, nil
+	}
+	if err == nil && len(sessions) > 1 {
+		names := make([]string, 0, len(sessions))
+		for _, s := range sessions {
+			names = append(names, s.Name)
+		}
+		return "", fmt.Errorf("no session specified and %d sessions exist (%s); "+
+			"pass name=<session>, or call set_active_session to pick one",
+			len(sessions), strings.Join(names, ", "))
+	}
+
+	if _, err := t.mgr.CreateSession(defaultSessionName, "", ""); err != nil {
+		return "", fmt.Errorf("no session was set, and creating the default %q session failed: %w",
+			defaultSessionName, err)
+	}
+	t.setActive(defaultSessionName)
+	return defaultSessionName, nil
 }
 
 // truncate caps output at maxLen runes with a dropped-count note.
@@ -428,7 +477,7 @@ func (t *tmuxTools) register(r *Registry) {
 	})
 	r.Register(&Tool{
 		Name:        "send_keys",
-		Description: "Send keystrokes to a tmux session.",
+		Description: "Send raw keystrokes to a tmux session WITHOUT waiting or returning output (for interactive input, control keys, or replying to a prompt). To run a command and get its output, use run_command instead.",
 		Schema: obj(map[string]interface{}{
 			"name": strProp("Name of the tmux session. Optional; defaults to the active session. Providing it makes that session active."),
 			"keys": strProp("Keys to send. Enter is sent automatically after the keys so commands execute."),
@@ -455,7 +504,7 @@ func (t *tmuxTools) register(r *Registry) {
 	})
 	r.Register(&Tool{
 		Name:        "run_command",
-		Description: "Run a command inside a tmux session and wait for it to finish, returning its output and exit code.",
+		Description: "Run a command inside a tmux session and wait for it to finish, returning its output and exit code. This is the default way to run a shell command: it creates a session automatically if none exists, so no setup call is needed.",
 		Schema: obj(map[string]interface{}{
 			"name":    strProp("Name of the tmux session. Optional; defaults to the active session. Providing it makes that session active."),
 			"command": strProp("Command to run inside the session. Enter is sent automatically and the tool WAITS for the command to finish, then returns its output and exit code. For a process that never exits (e.g. launching a server), it will report 'still running' at the timeout — that's expected; verify such processes with capture_pane or a port/health check instead."),
@@ -592,7 +641,13 @@ func (t *tmuxTools) sendKeys(ctx context.Context, a map[string]interface{}) (str
 	if err := t.mgr.SendKeys(name, keys, enter); err != nil {
 		return "", fmt.Errorf("sending keys to tmux session: %w", err)
 	}
-	return fmt.Sprintf("Sent keys to tmux session '%s': %s", name, keys), nil
+	// Say explicitly that no output is coming. "Sent keys ..." alone is
+	// indistinguishable from "the command ran and printed nothing", which is
+	// exactly the ambiguity that sent an agent hunting with capture_pane.
+	return fmt.Sprintf("Sent keys to tmux session '%s': %s\n\n"+
+		"(send_keys does not wait or return output. Use run_command to run something "+
+		"and get its output and exit code, or capture_pane to read the screen now.)",
+		name, keys), nil
 }
 
 func (t *tmuxTools) capturePane(ctx context.Context, a map[string]interface{}) (string, error) {
