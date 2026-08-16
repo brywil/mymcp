@@ -188,23 +188,49 @@ var runCmdSeq uint64
 const defaultRunTimeout = 60 * time.Second
 
 // RunCommand runs a command in a session and, when enter is true, waits for it
-// to finish (detected via a unique sentinel echoed with the exit code).
+// to finish, returning ONLY that command's output plus its exit code.
+//
+// The command and both markers are sent as ONE shell line. That is the whole
+// trick, and getting it wrong is subtle: this used to send the command, press
+// Enter, and then immediately type the sentinel as a second line. For anything
+// that finishes instantly that works. For anything slow — `du` over a large
+// tree, a build, a download — the sentinel keystrokes are typed WHILE the first
+// command is still running, the tty echoes them to the screen interleaved into
+// the running command's output, and the output parser then truncates at that
+// echoed line. Symptom: "output cut off partway through", and for slow enough
+// commands an empty result, because the echo lands near the top. Sending one
+// line means nothing is typed while the command runs.
+//
+// A START marker bounds the output at the front so the result contains this
+// command's output and nothing else. Capturing a fixed slab of scrollback (as
+// this used to) returns whatever preceded it too, which reads as the pane
+// "echoing the entire history" and is indistinguishable from the current
+// command having produced that text.
 func (m *tmuxManager) RunCommand(name, command string, enter bool, timeoutSec int) (string, error) {
-	if err := m.sendLiteral(name, command); err != nil {
-		return "", err
-	}
 	if !enter {
+		if err := m.sendLiteral(name, command); err != nil {
+			return "", err
+		}
 		time.Sleep(300 * time.Millisecond)
 		return m.CapturePane(name, 0)
 	}
-	if err := m.sendEnter(name); err != nil {
-		return "", err
-	}
 
 	n := atomic.AddUint64(&runCmdSeq, 1)
-	marker := fmt.Sprintf("__GOCLAW_DONE_%d_%d__", time.Now().UnixNano(), n)
-	sentinel := fmt.Sprintf("printf '\\n%s%%s\\n' \"$?\"", marker)
-	if err := m.sendLiteral(name, sentinel); err != nil {
+	id := fmt.Sprintf("%d_%d", time.Now().UnixNano(), n)
+	startMarker := "__MYMCP_START_" + id + "__"
+	doneMarker := "__MYMCP_DONE_" + id + "__"
+
+	// printf START; eval '<command>'; printf DONE$?   — one line, one Enter.
+	//
+	// The command goes through eval inside single quotes rather than being spliced
+	// in raw. Splicing it raw means the command's own text can terminate the line
+	// and take the DONE marker with it: `ls # list files` comments out everything
+	// after it, so the marker never prints and the tool waits out the full timeout
+	// on a command that finished instantly. Quoting confines a trailing comment
+	// (and stray `&`, unbalanced constructs, etc.) to the eval'd string.
+	line := fmt.Sprintf("printf '\\n%s\\n'; eval '%s'; printf '\\n%s%%s\\n' \"$?\"",
+		startMarker, shellSingleQuote(command), doneMarker)
+	if err := m.sendLiteral(name, line); err != nil {
 		return "", err
 	}
 	if err := m.sendEnter(name); err != nil {
@@ -215,14 +241,13 @@ func (m *tmuxManager) RunCommand(name, command string, enter bool, timeoutSec in
 	if timeoutSec <= 0 {
 		timeout = defaultRunTimeout
 	}
-	doneRe := regexp.MustCompile(regexp.QuoteMeta(marker) + `(\d+)`)
+	// Anchored to line boundaries: the echoed command line contains both marker
+	// strings, but only as substrings mid-line. printf writes them alone on a
+	// line, so anchoring distinguishes the real markers from the echo.
+	doneRe := regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(doneMarker) + `(\d+)\s*$`)
 
 	deadline := time.Now().Add(timeout)
 	const pollInterval = 300 * time.Millisecond
-	// Detect completion on the visible pane (the sentinel is the last thing
-	// printed, so it lands at the bottom). Once found — or on timeout — grab a
-	// bounded slice of history so output that scrolled off-screen is still
-	// returned, without dumping the entire scrollback.
 	for {
 		time.Sleep(pollInterval)
 		pane, err := m.CapturePane(name, 0)
@@ -230,14 +255,17 @@ func (m *tmuxManager) RunCommand(name, command string, enter bool, timeoutSec in
 			return "", err
 		}
 		if doneRe.MatchString(pane) {
-			full, _ := m.CapturePane(name, 400)
-			loc := doneRe.FindStringSubmatchIndex(full)
-			exitCode := full[loc[2]:loc[3]]
-			return trimRunOutput(full, marker, exitCode, false), nil
+			full, _ := m.CapturePane(name, runCaptureLines)
+			mm := doneRe.FindStringSubmatch(full)
+			exitCode := ""
+			if len(mm) > 1 {
+				exitCode = mm[1]
+			}
+			return sliceRunOutput(full, startMarker, doneMarker, exitCode, false), nil
 		}
 		if time.Now().After(deadline) {
-			full, _ := m.CapturePane(name, 400)
-			return trimRunOutput(full, marker, "", true), nil
+			full, _ := m.CapturePane(name, runCaptureLines)
+			return sliceRunOutput(full, startMarker, doneMarker, "", true), nil
 		}
 	}
 }
@@ -266,27 +294,91 @@ func (m *tmuxManager) sendEnter(name string) error {
 	return nil
 }
 
-// trimRunOutput cleans a captured pane for RunCommand and appends a status footer.
-func trimRunOutput(pane, marker, exitCode string, timedOut bool) string {
+// shellSingleQuote escapes a string for embedding inside single quotes in a
+// POSIX shell: end the quote, emit an escaped quote, reopen. 'it'\”s'
+func shellSingleQuote(s string) string {
+	return strings.ReplaceAll(s, "'", `'\''`)
+}
+
+// runCaptureLines is how much scrollback to pull once the command has finished.
+// Generous because the START marker bounds the result anyway: capturing more than
+// needed is free, capturing too little silently loses the top of a long output.
+const runCaptureLines = 2000
+
+// sliceRunOutput extracts exactly the text between the START and DONE markers and
+// appends a status footer.
+//
+// Both markers appear TWICE in the pane: once inside the echoed command line
+// (mid-line, as part of the printf that emits them) and once alone on their own
+// line where printf actually wrote them. Line-anchored matching is what tells
+// those apart, and it is why the markers are printed with leading newlines.
+//
+// The START marker is matched LAST-first: a session that has run this command
+// before may still hold an older instance in scrollback, and the marker embeds a
+// timestamp+counter so a stale one can only be an earlier call. Taking the last
+// occurrence keeps the result to the current invocation.
+func sliceRunOutput(pane, startMarker, doneMarker, exitCode string, timedOut bool) string {
 	lines := strings.Split(pane, "\n")
-	kept := make([]string, 0, len(lines))
-	for _, ln := range lines {
-		if strings.Contains(ln, marker) {
-			if !timedOut {
+
+	start := -1
+	for i, ln := range lines {
+		if strings.TrimSpace(ln) == startMarker {
+			start = i // keep scanning; last wins
+		}
+	}
+	end := len(lines)
+	for i := start + 1; i < len(lines); i++ {
+		t := strings.TrimSpace(ln2(lines, i))
+		if strings.HasPrefix(t, doneMarker) {
+			end = i
+			break
+		}
+	}
+
+	var body []string
+	if start >= 0 {
+		body = lines[start+1 : end]
+	} else {
+		// START scrolled off (output longer than the capture) — fall back to
+		// everything before DONE, and say so rather than silently returning a
+		// partial result that looks complete.
+		for i := 0; i < len(lines); i++ {
+			if strings.HasPrefix(strings.TrimSpace(lines[i]), doneMarker) {
+				end = i
 				break
 			}
-			continue
 		}
-		if strings.Contains(ln, "__GOCLAW_DONE_") {
+		body = lines[:end]
+	}
+
+	// Drop any residual marker text (e.g. the echoed command line) so markers
+	// never leak into what the caller reads as command output.
+	kept := make([]string, 0, len(body))
+	for _, ln := range body {
+		if strings.Contains(ln, "__MYMCP_START_") || strings.Contains(ln, "__MYMCP_DONE_") {
 			continue
 		}
 		kept = append(kept, ln)
 	}
 	out := strings.TrimRight(strings.Join(kept, "\n"), "\n")
-	if timedOut {
-		return out + "\n\n[still running — command did not finish within the timeout. If this is a server or other long-running process, it may be fine; check with capture_pane or a port/health check rather than run_command.]"
+
+	var note string
+	if start < 0 && !timedOut {
+		note = fmt.Sprintf("\n\n[note: output exceeded %d captured lines; the beginning was truncated]", runCaptureLines)
 	}
-	return out + fmt.Sprintf("\n\n[command finished, exit code %s]", exitCode)
+	if timedOut {
+		return out + note + "\n\n[still running — the command has not finished yet. Output above is what it has printed so far. " +
+			"Poll with capture_pane, or re-run with a larger timeout_seconds. For a server or other process that never exits, this is expected.]"
+	}
+	return out + note + fmt.Sprintf("\n\n[command finished, exit code %s]", exitCode)
+}
+
+// ln2 is a bounds-safe line accessor.
+func ln2(lines []string, i int) string {
+	if i < 0 || i >= len(lines) {
+		return ""
+	}
+	return lines[i]
 }
 
 // RenameSession renames a tmux session.
