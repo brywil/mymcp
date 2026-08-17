@@ -1538,6 +1538,85 @@ var webFetchSchema = map[string]interface{}{
 	"required": []string{"url"},
 }
 
+// directFetch reads a URL over plain HTTP, for use when the hosted fetch API cannot.
+//
+// Content-Type decides the treatment, and getting that wrong is the whole risk here: a raw
+// Markdown or JSON URL must be returned VERBATIM, because HTML-stripping it would quietly
+// mangle the exact thing the caller asked for. Only text/html goes through the parser.
+func (ws *webSearchTools) directFetch(ctx context.Context, targetURL string) (string, error) {
+	const maxBody = 2 << 20 // 2 MiB: enough for any document, bounded for a tool result
+
+	req, err := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("building request: %s", err.Error())
+	}
+	// A browser-ish UA on purpose. Several hosts (Hugging Face among them) serve a stub or
+	// refuse outright to unfamiliar agents, which would turn this fallback into a second
+	// confusing failure rather than a rescue.
+	req.Header.Set("User-Agent",
+		"Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36")
+	req.Header.Set("Accept", "text/markdown, text/plain, text/html;q=0.9, */*;q=0.5")
+
+	client := &http.Client{Timeout: 45 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("request failed: %s", err.Error())
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
+	if err != nil {
+		return "", fmt.Errorf("reading body: %s", err.Error())
+	}
+	if len(body) == 0 {
+		// An empty 200 is a failure, not a document. Saying so is the difference between
+		// this fallback helping and it handing back a convincing blank.
+		return "", fmt.Errorf("HTTP 200 but empty body")
+	}
+
+	if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html") {
+		doc, perr := nethtml.Parse(strings.NewReader(string(body)))
+		if perr != nil {
+			return "", fmt.Errorf("parsing HTML: %s", perr.Error())
+		}
+		text := strings.TrimSpace(visibleText(doc))
+		if text == "" {
+			return "", fmt.Errorf("HTML parsed to no visible text (%d bytes of markup)", len(body))
+		}
+		return text, nil
+	}
+	return string(body), nil
+}
+
+// visibleText walks an HTML tree collecting text a reader would see, skipping the elements
+// whose contents are code rather than prose. Without the skip list a modern page returns
+// mostly minified JavaScript, which is worse than returning nothing because it looks like
+// content and consumes the caller's context.
+func visibleText(n *nethtml.Node) string {
+	switch n.Type {
+	case nethtml.TextNode:
+		return n.Data
+	case nethtml.ElementNode:
+		switch strings.ToLower(n.Data) {
+		case "script", "style", "noscript", "template", "svg", "head":
+			return ""
+		}
+	}
+	var sb strings.Builder
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		if t := visibleText(c); t != "" {
+			sb.WriteString(t)
+			if !strings.HasSuffix(t, "\n") {
+				sb.WriteString(" ")
+			}
+		}
+	}
+	return sb.String()
+}
+
 func (ws *webSearchTools) webFetch(ctx context.Context, args map[string]interface{}) (string, error) {
 	targetURL, ok := args["url"].(string)
 	if !ok || targetURL == "" {
@@ -1546,8 +1625,49 @@ func (ws *webSearchTools) webFetch(ctx context.Context, args map[string]interfac
 
 	resp, err := ws.queryOllamaFetch(targetURL)
 	if err != nil {
-		log.Printf("[WebFetch] Error for URL %s: %s", targetURL, err.Error())
-		return "", fmt.Errorf("fetch failed for URL %s: %s", targetURL, err.Error())
+		// Ollama's hosted fetch API is not the only way to read a public URL, and it
+		// fails on sites it has no index for: huggingface.co model pages return
+		// HTTP 404 {"error": "not found"} from it while a plain GET of the same URL
+		// returns the full page. Before this fallback, web_fetch had a single point of
+		// failure and no recourse -- it reported the 404 and the caller was left with
+		// nothing, even though the content was one GET away and this very package
+		// already ships an http_request tool that would have succeeded.
+		//
+		// Observed consequence: asked to read a Hugging Face model card, an agent got
+		// the 404, searched eight more times, then INVENTED the document's contents.
+		// A fallback would have made that impossible.
+		log.Printf("[WebFetch] Ollama API failed for %s (%s) -- falling back to direct GET",
+			targetURL, err.Error())
+		text, directErr := ws.directFetch(ctx, targetURL)
+		if directErr != nil {
+			// Report BOTH failures. Reporting only the second would hide that the
+			// primary path is down, which is what matters if it stays down.
+			log.Printf("[WebFetch] Direct GET also failed for %s: %s", targetURL, directErr.Error())
+
+			// WORDING MATTERS MORE THAN IT LOOKS. The old message ended in the upstream's
+			// own text -- {"error": "not found"} -- which reads as "this page does not
+			// exist" when it actually meant "the hosted fetch service could not retrieve
+			// it". An agent asked to read a page the user had just linked took the former
+			// reading, and was left choosing between telling the user their own repo was
+			// missing and inventing the contents. It invented them.
+			//
+			// So the error now says which of those two things happened. Only the direct
+			// GET's status is evidence about the page; the hosted API's is evidence about
+			// the hosted API.
+			if strings.Contains(directErr.Error(), "HTTP 404") {
+				return "", fmt.Errorf("%s returned HTTP 404 on a direct request, so the page "+
+					"most likely does not exist at that URL (the hosted fetch API also failed: %s)",
+					targetURL, err.Error())
+			}
+			return "", fmt.Errorf("could not retrieve %s -- this is a TOOL failure and is NOT "+
+				"evidence the page is missing. Hosted fetch API: %s. Direct GET: %s. The page may "+
+				"well exist; retry with the http_request tool, or a raw-content URL (on Hugging "+
+				"Face use /resolve/main/<file> rather than /blob/main/<file>). Do not report the "+
+				"page as nonexistent, and do not describe its contents, on the strength of this",
+				targetURL, err.Error(), directErr.Error())
+		}
+		log.Printf("[WebFetch] Direct GET recovered %d chars for %s", len(text), targetURL)
+		resp = &ollamaWebFetchResult{Title: targetURL + " (direct GET)", Content: text}
 	}
 
 	ws.mu.Lock()
