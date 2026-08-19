@@ -279,6 +279,84 @@ func TestParseCSSCombinators(t *testing.T) {
 	}
 }
 
+// Combinator chains of 3+ compounds must thread the matched node forward
+// through each step. Reading every combinator from the original (rightmost)
+// node reduces any such chain to its two rightmost compounds, silently
+// matching the wrong set. These pin the descendant/child/adjacent/sibling
+// combinators in sequences longer than two.
+func TestParseCSSChainedCombinators(t *testing.T) {
+	ht := &httpTools{}
+	// Tree:
+	//   <body>
+	//     <div>            (a)
+	//       <p>           (b)  -- child of a
+	//         <span>hi</span>(c) -- descendant of a, child of b
+	//     <h1>0</h1>       (d)
+	//     <h2>1</h2>       (e)  -- adjacent to d, sibling of d
+	//     <p>2</p>         (f)  -- adjacent to e
+	//     <p>3</p>         (g)  -- sibling of e, sibling of d, adjacent to f
+	html := `<html><body>` +
+		`<div><p><span>hi</span></p></div>` +
+		`<h1>0</h1><h2>1</h2><p>2</p><p>3</p>` +
+		`</body></html>`
+
+	count := func(t *testing.T, sel string) int {
+		t.Helper()
+		out, err := ht.parseCSS(context.Background(), map[string]interface{}{"input": html, "selector": sel})
+		if err != nil {
+			t.Fatalf("selector %q: %v", sel, err)
+		}
+		n := 0
+		if strings.HasPrefix(out, "Found ") {
+			s := strings.TrimPrefix(out, "Found ")
+			s = strings.TrimSpace(s)
+			s = s[:strings.Index(s, " ")]
+			n, err = strconv.Atoi(s)
+			if err != nil {
+				t.Fatalf("could not parse count from %q: %v", out, err)
+			}
+		}
+		return n
+	}
+
+	// descendant -> descendant: span with ancestor p with ancestor div.
+	if n := count(t, "div p span"); n != 1 {
+		t.Errorf("div p span: want 1, got %d", n)
+	}
+	// child -> descendant: span descendant of p, p child of div.
+	if n := count(t, "div > p span"); n != 1 {
+		t.Errorf("div > p span: want 1, got %d", n)
+	}
+	// child -> child: span child of p, p child of div.
+	if n := count(t, "div > p > span"); n != 1 {
+		t.Errorf("div > p > span: want 1, got %d", n)
+	}
+	// child -> child with a non-matching middle step: p child of span is false.
+	if n := count(t, "div > span > p"); n != 0 {
+		t.Errorf("div > span > p: want 0, got %d", n)
+	}
+	// adjacent -> sibling: p (the "2") adjacent to h2, h2 sibling of h1.
+	if n := count(t, "h1 ~ h2 + p"); n != 1 {
+		t.Errorf("h1 ~ h2 + p: want 1, got %d", n)
+	}
+	// adjacent -> adjacent: the "3" is adjacent to "2", which is adjacent to h2.
+	if n := count(t, "h2 + p + p"); n != 1 {
+		t.Errorf("h2 + p + p: want 1, got %d", n)
+	}
+	// sibling -> adjacent: p adjacent to h2, h2 sibling of h1.
+	if n := count(t, "h1 + h2 ~ p"); n != 2 {
+		t.Errorf("h1 + h2 ~ p: want 2 (the two p after h2), got %d", n)
+	}
+	// sibling -> sibling: both p after h1, sibling of h1, sibling of each other.
+	if n := count(t, "h1 ~ p ~ p"); n != 1 {
+		t.Errorf("h1 ~ p ~ p: want 1 (only the last p has an earlier p that is a sibling of h1), got %d", n)
+	}
+	// descendant -> child: span child of p, p descendant of body.
+	if n := count(t, "body p > span"); n != 1 {
+		t.Errorf("body p > span: want 1, got %d", n)
+	}
+}
+
 // --- web_search ----------------------------------------------------------
 
 // When the live search is unavailable, a previously cached result must be

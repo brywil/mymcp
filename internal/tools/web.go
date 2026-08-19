@@ -1292,7 +1292,10 @@ func (ht *httpTools) matchCompound(node *nethtml.Node, compound string) (bool, e
 }
 
 // matchesSelectorParts matches a full selector: the node against the last
-// compound, then each earlier compound according to its combinator.
+// compound, then each earlier compound according to its combinator. Each step
+// must advance from the node matched by the previous step — reading from the
+// original (rightmost) node at every step would reduce any chain of 3+
+// compounds to its two rightmost compounds, silently matching the wrong set.
 func (ht *httpTools) matchesSelectorParts(node *nethtml.Node, compounds []string, combs []string, pm map[*nethtml.Node]*nethtml.Node) (bool, error) {
 	if ok, err := ht.matchCompound(node, compounds[len(compounds)-1]); err != nil {
 		return false, err
@@ -1300,23 +1303,29 @@ func (ht *httpTools) matchesSelectorParts(node *nethtml.Node, compounds []string
 		return false, nil
 	}
 
+	cur := node
 	for i := len(compounds) - 2; i >= 0; i-- {
 		want := compounds[i]
 		switch combs[i] {
 		case ">":
-			if ok, err := ht.matchCompound(pm[node], want); err != nil {
+			cur = pm[cur]
+			if cur == nil {
+				return false, nil
+			}
+			if ok, err := ht.matchCompound(cur, want); err != nil {
 				return false, err
 			} else if !ok {
 				return false, nil
 			}
 		case " ":
 			found := false
-			for a := pm[node]; a != nil; a = pm[a] {
+			for a := pm[cur]; a != nil; a = pm[a] {
 				ok, err := ht.matchCompound(a, want)
 				if err != nil {
 					return false, err
 				}
 				if ok {
+					cur = a
 					found = true
 					break
 				}
@@ -1325,19 +1334,24 @@ func (ht *httpTools) matchesSelectorParts(node *nethtml.Node, compounds []string
 				return false, nil
 			}
 		case "+":
-			if ok, err := ht.matchCompound(node.PrevSibling, want); err != nil {
+			cur = cur.PrevSibling
+			if cur == nil {
+				return false, nil
+			}
+			if ok, err := ht.matchCompound(cur, want); err != nil {
 				return false, err
 			} else if !ok {
 				return false, nil
 			}
 		case "~":
 			found := false
-			for sib := node.PrevSibling; sib != nil; sib = sib.PrevSibling {
+			for sib := cur.PrevSibling; sib != nil; sib = sib.PrevSibling {
 				ok, err := ht.matchCompound(sib, want)
 				if err != nil {
 					return false, err
 				}
 				if ok {
+					cur = sib
 					found = true
 					break
 				}
