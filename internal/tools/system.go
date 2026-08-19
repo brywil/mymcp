@@ -46,7 +46,7 @@ func (s *sysTools) resolve(p string) (string, error) {
 func (s *sysTools) register(r *Registry) {
 	r.Register(&Tool{
 		Name:        "grep",
-		Description: "Search file contents for a regex pattern. Case-sensitive by default (Linux). Use case_insensitive=true for case-insensitive.",
+		Description: "Search file contents for a regex pattern. Case-sensitive by default (Linux); use case_insensitive=true to ignore case. Directory searches cover common text extensions by default and say so when they skip other files; pass all_files=true to search every file.",
 		Schema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -55,6 +55,7 @@ func (s *sysTools) register(r *Registry) {
 				"recursive":        map[string]interface{}{"type": "boolean", "description": "Recursively search directories (default: true for directories, false for files)"},
 				"case_insensitive": map[string]interface{}{"type": "boolean", "description": "Case-insensitive matching (default: false — case-sensitive, matching Linux semantics)"},
 				"max_results":      map[string]interface{}{"type": "integer", "description": "Maximum number of results to return (default: 100)"},
+				"all_files":        map[string]interface{}{"type": "boolean", "description": "Also search files whose extension is not in the default set (.go .js .ts .py .md .json .yaml .yml .toml .txt .sh .html .css). Default: false"},
 			},
 			"required": []string{"pattern"},
 		},
@@ -129,13 +130,13 @@ func (s *sysTools) register(r *Registry) {
 	})
 	r.Register(&Tool{
 		Name:        "awk",
-		Description: "Perform awk-like text processing on a file. Supports field access ($1, $2), pattern matching, and print statements.",
+		Description: "Perform awk-like line processing on a file. Form: [pattern] { print args }. Patterns: /regex/, $N == \"value\", $N != \"value\". Print args: $0 (whole line), $N fields, \"literal\" strings, comma-separated. printf and BEGIN/END are not supported.",
 		Schema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
 				"path":            strProp("Path to the file to process (relative or absolute)"),
-				"program":         strProp("Awk-like program (e.g., '/error/ { print $0 }' or '{ print $1, $2 }')"),
-				"field_separator": strProp("Field separator (default: whitespace)"),
+				"program":         strProp("Awk-like program (e.g., '/error/ { print $0 }' or '{ print $1, $2 }'). Unsupported constructs are rejected with an error rather than silently producing no output."),
+				"field_separator": strProp("Separator used to join multiple print arguments (default: a single space)"),
 			},
 			"required": []string{"path", "program"},
 		},
@@ -169,22 +170,25 @@ func (s *sysTools) sed(_ context.Context, args map[string]interface{}) (string, 
 		return "", fmt.Errorf("reading file: %s", err.Error())
 	}
 
-	re, err := regexp.Compile(pattern)
+	// Case-insensitivity belongs on the pattern, not the text: lowercasing the
+	// line before substituting rewrites the parts of the line the match never
+	// touched. (?i) prepended here lets a user-supplied (?-i) still override.
+	src := pattern
+	if argBool(args, "case_insensitive", false) {
+		src = "(?i)" + src
+	}
+	re, err := regexp.Compile(src)
 	if err != nil {
 		return "", fmt.Errorf("invalid pattern: %s", err.Error())
 	}
 
 	global := argBool(args, "global", false)
-	caseInsensitive := argBool(args, "case_insensitive", false)
 
 	lines := strings.Split(string(data), "\n")
 	changed := 0
 	for i, line := range lines {
 		text := line
 		original := line
-		if caseInsensitive {
-			text = strings.ToLower(text)
-		}
 		if global {
 			text = re.ReplaceAllString(text, replacement)
 		} else {
@@ -229,14 +233,22 @@ func (s *sysTools) awk(_ context.Context, args map[string]interface{}) (string, 
 		return "", fmt.Errorf("reading file: %s", err.Error())
 	}
 
-	lines := strings.Split(string(data), "\n")
+	// Parse and validate up front. Validating per line would let an unsupported
+	// construct survive as "(no output)" whenever no line matched the pattern,
+	// which reads as "the file has no such lines" — a wrong answer, not an error.
+	pattern, body, err := parseAwkProgram(program)
+	if err != nil {
+		return "", err
+	}
 
-	var output strings.Builder
 	fieldSep := " "
 	if fs := argString(args, "field_separator"); fs != "" {
 		fieldSep = fs
 	}
 
+	lines := strings.Split(string(data), "\n")
+
+	var output strings.Builder
 	for _, line := range lines {
 		if line == "" {
 			continue
@@ -245,11 +257,19 @@ func (s *sysTools) awk(_ context.Context, args map[string]interface{}) (string, 
 		if len(fields) == 0 {
 			continue
 		}
-		if s.awkMatches(line, fields, program) {
-			result := s.awkExecute(line, fields, program, fieldSep)
-			if result != "" {
-				output.WriteString(result + "\n")
-			}
+		matched, err := awkPatternMatches(pattern, line, fields)
+		if err != nil {
+			return "", err
+		}
+		if !matched {
+			continue
+		}
+		result, err := awkExecuteBody(body, line, fields, fieldSep)
+		if err != nil {
+			return "", err
+		}
+		if result != "" {
+			output.WriteString(result + "\n")
 		}
 	}
 
@@ -264,97 +284,141 @@ func (s *sysTools) awk(_ context.Context, args map[string]interface{}) (string, 
 	return result, nil
 }
 
-// awkMatches checks if a line matches the awk program patterns.
-func (s *sysTools) awkMatches(line string, fields []string, program string) bool {
-	patternPart := program
-	if idx := strings.Index(program, "{"); idx != -1 {
-		patternPart = program[:idx]
+// parseAwkProgram splits a program into its pattern condition and action body.
+// A program with no pattern (e.g. "{ print $1 }") matches every line.
+func parseAwkProgram(program string) (pattern, body string, err error) {
+	program = strings.TrimSpace(program)
+	if program == "" {
+		return "", "", errors.New("awk program is empty")
 	}
-
-	if strings.Contains(patternPart, "BEGIN") || strings.Contains(patternPart, "END") {
-		return true
-	}
-
-	if strings.HasPrefix(strings.TrimSpace(patternPart), "/") {
-		reEnd := strings.Index(patternPart[1:], "/")
-		if reEnd != -1 {
-			pattern := patternPart[1 : reEnd+1]
-			re, err := regexp.Compile(pattern)
-			if err == nil && re.MatchString(line) {
-				return true
-			}
+	if idx := strings.Index(program, "{"); idx >= 0 {
+		pattern = strings.TrimSpace(program[:idx])
+		body = program[idx+1:]
+		if end := strings.LastIndex(body, "}"); end >= 0 {
+			body = body[:end]
 		}
+		return pattern, strings.TrimSpace(body), nil
 	}
-
-	if strings.Contains(patternPart, "$") {
-		return s.awkFieldMatch(fields, patternPart)
-	}
-
-	return true
+	return "", strings.TrimSpace(program), nil
 }
 
-// awkFieldMatch checks field conditions in a pattern.
-func (s *sysTools) awkFieldMatch(fields []string, pattern string) bool {
-	if strings.Contains(pattern, "==") {
-		parts := strings.SplitN(pattern, "==", 2)
-		if len(parts) == 2 {
-			fieldIdx, err := strconv.Atoi(strings.TrimSpace(parts[0][1:]))
-			if err == nil && fieldIdx > 0 && fieldIdx <= len(fields) {
-				value := strings.TrimSpace(parts[1])
-				value = strings.Trim(value, "\"")
-				return fields[fieldIdx-1] == value
+// awkPatternMatches applies the pattern part of the program. The supported
+// forms are deliberately small; anything else is a caller error, not a silent
+// no-match, because "no output" cannot be told apart from "no match".
+func awkPatternMatches(pattern, line string, fields []string) (bool, error) {
+	if pattern == "" {
+		return true, nil
+	}
+	if strings.HasPrefix(pattern, "/") {
+		if end := strings.Index(pattern[1:], "/"); end >= 0 {
+			re, err := regexp.Compile(pattern[1 : end+1])
+			if err != nil {
+				return false, fmt.Errorf("invalid regex in pattern %q: %s", pattern, err.Error())
 			}
+			return re.MatchString(line), nil
 		}
+		return false, fmt.Errorf("unterminated /.../ in pattern %q", pattern)
 	}
 	if strings.Contains(pattern, "!=") {
 		parts := strings.SplitN(pattern, "!=", 2)
-		if len(parts) == 2 {
-			fieldIdx, err := strconv.Atoi(strings.TrimSpace(parts[0][1:]))
-			if err == nil && fieldIdx > 0 && fieldIdx <= len(fields) {
-				value := strings.TrimSpace(parts[1])
-				value = strings.Trim(value, "\"")
-				return fields[fieldIdx-1] != value
-			}
-		}
+		m, err := awkFieldCompare(parts[0], parts[1], fields, true)
+		return m, err
 	}
-	return false
+	if strings.Contains(pattern, "==") {
+		parts := strings.SplitN(pattern, "==", 2)
+		return awkFieldCompare(parts[0], parts[1], fields, false)
+	}
+	return false, fmt.Errorf("unsupported pattern %q — supported patterns: /regex/, $N == \"value\", $N != \"value\"", pattern)
 }
 
-// awkExecute executes the action part of an awk program.
-func (s *sysTools) awkExecute(line string, fields []string, program string, sep string) string {
-	action := program
-	if idx := strings.Index(program, "{"); idx != -1 {
-		action = program[idx:]
+// awkFieldCompare evaluates a $N == "v" or $N != "v" field comparison.
+// isNotEq reports whether the comparison is a negated equality ("!="); it is
+// true only for "!=". (Passing the wrong value here silently inverts every
+// comparison — the call sites must match this meaning exactly.)
+func awkFieldCompare(left, right string, fields []string, isNotEq bool) (bool, error) {
+	left = strings.TrimSpace(left)
+	if !strings.HasPrefix(left, "$") {
+		return false, fmt.Errorf("the left side of a field comparison must be a field like $1 (got %q)", left)
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(left[1:]))
+	if err != nil || n < 1 {
+		return false, fmt.Errorf("expected a field number like $1 (got %q)", left)
+	}
+	if n > len(fields) {
+		// No such field: == is false, != is true, as in awk.
+		return isNotEq, nil
+	}
+	value := strings.Trim(strings.TrimSpace(right), "\"")
+	return (fields[n-1] == value) != isNotEq, nil
+}
+
+// awkExecuteBody runs the action part of the program on one line.
+func awkExecuteBody(body, line string, fields []string, sep string) (string, error) {
+	if body == "" {
+		return "", nil
+	}
+	if strings.Contains(body, "printf") {
+		return "", fmt.Errorf("printf is not supported — use print with comma-separated arguments, e.g. { print $1, $2 }")
+	}
+	if !strings.Contains(body, "print") {
+		return "", fmt.Errorf("unsupported awk action %q — supported action: print of $N fields and \"literal\" strings", body)
 	}
 
-	if strings.Contains(action, "print") {
-		printArgs := strings.TrimSuffix(strings.TrimPrefix(action, "{ print "), "}")
-		printArgs = strings.TrimSpace(printArgs)
+	idx := strings.Index(body, "print")
+	spec := strings.TrimSpace(body[idx+len("print"):])
+	spec = strings.TrimSuffix(spec, ";")
+	if spec == "" {
+		return line, nil // bare print: the whole line
+	}
 
-		if printArgs == "" || printArgs == "$0" {
-			return line
+	var parts []string
+	for _, raw := range awkSplitArgs(spec) {
+		tok := strings.TrimSpace(raw)
+		if tok == "" {
+			continue
 		}
-
-		var parts []string
-		for _, part := range strings.Fields(printArgs) {
-			if strings.HasPrefix(part, "$") {
-				fieldIdx, err := strconv.Atoi(part[1:])
-				if err == nil && fieldIdx > 0 && fieldIdx <= len(fields) {
-					parts = append(parts, fields[fieldIdx-1])
-				}
-			} else {
-				part = strings.Trim(part, "\"")
-				parts = append(parts, part)
+		switch {
+		case tok == "$0":
+			parts = append(parts, line)
+		case strings.HasPrefix(tok, "$"):
+			n, err := strconv.Atoi(strings.TrimSpace(tok[1:]))
+			if err != nil || n < 1 {
+				return "", fmt.Errorf("print argument %q is not a field reference like $1 or $0", tok)
 			}
+			if n > len(fields) {
+				parts = append(parts, "") // awk: an out-of-range field is empty
+				break
+			}
+			parts = append(parts, fields[n-1])
+		case len(tok) >= 2 && tok[0] == '"' && tok[len(tok)-1] == '"':
+			parts = append(parts, tok[1:len(tok)-1])
+		default:
+			return "", fmt.Errorf("print argument %q is not supported — use $N fields or \"literal\" strings", tok)
 		}
-		return strings.Join(parts, sep)
 	}
+	return strings.Join(parts, sep), nil
+}
 
-	if strings.Contains(action, "printf") {
-		return line
+// awkSplitArgs splits a print argument list on commas, leaving commas inside
+// double quotes alone.
+func awkSplitArgs(spec string) []string {
+	var out []string
+	var cur strings.Builder
+	inStr := false
+	for _, r := range spec {
+		switch {
+		case r == '"':
+			inStr = !inStr
+			cur.WriteRune(r)
+		case r == ',' && !inStr:
+			out = append(out, cur.String())
+			cur.Reset()
+		default:
+			cur.WriteRune(r)
+		}
 	}
-
-	return ""
+	out = append(out, cur.String())
+	return out
 }
 
 func (s *sysTools) grep(_ context.Context, args map[string]interface{}) (string, error) {
@@ -374,86 +438,134 @@ func (s *sysTools) grep(_ context.Context, args map[string]interface{}) (string,
 	if err != nil {
 		return "", err
 	}
-	re, err := regexp.Compile(pattern)
+	// Case-insensitivity belongs on the pattern, not on a lowercased copy of the
+	// text: lowercasing the line made "FOO" in the file fail to match the
+	// pattern "FOO" — the flag actively hid the lines it was meant to find.
+	src := pattern
+	if argBool(args, "case_insensitive", false) {
+		src = "(?i)" + src
+	}
+	re, err := regexp.Compile(src)
 	if err != nil {
 		return "", fmt.Errorf("invalid regex pattern: %s", err.Error())
 	}
-	recursive := argBool(args, "recursive", false)
-	caseInsensitive := argBool(args, "case_insensitive", false)
 	maxResults := argInt(args, "max_results", 100)
 	if maxResults <= 0 {
 		maxResults = 100
 	}
+	allFiles := argBool(args, "all_files", false)
 
 	var results []string
-	matchCount := 0
+	total := 0
+	sawDir := false
+	var skippedNote string
 
 	if info.IsDir() {
-		if !recursive {
-			recursive = true
-		}
-		_ = recursive
-		err = filepath.Walk(resolved, func(fp string, fi os.FileInfo, err error) error {
-			if err != nil {
+		sawDir = true
+		skipped := map[string]int{}
+		walkErr := filepath.Walk(resolved, func(fp string, fi os.FileInfo, err error) error {
+			if err != nil || fi.IsDir() {
 				return nil
 			}
-			if fi.IsDir() {
+			ext := strings.ToLower(filepath.Ext(fp))
+			if !allFiles && !grepDefaultExtensions[ext] {
+				skipped[ext]++
 				return nil
 			}
-			if strings.HasSuffix(fp, ".go") || strings.HasSuffix(fp, ".js") ||
-				strings.HasSuffix(fp, ".ts") || strings.HasSuffix(fp, ".py") ||
-				strings.HasSuffix(fp, ".md") || strings.HasSuffix(fp, ".json") ||
-				strings.HasSuffix(fp, ".yaml") || strings.HasSuffix(fp, ".yml") ||
-				strings.HasSuffix(fp, ".toml") || strings.HasSuffix(fp, ".txt") ||
-				strings.HasSuffix(fp, ".sh") || strings.HasSuffix(fp, ".html") ||
-				strings.HasSuffix(fp, ".css") {
-				data, err := os.ReadFile(fp)
-				if err != nil {
-					return nil
-				}
-				relativePath, _ := filepath.Rel(s.root, fp)
-				matches := s.grepLines(string(data), re, caseInsensitive, relativePath)
-				results = append(results, matches...)
-				matchCount += len(matches)
-				if matchCount >= maxResults {
-					return filepath.SkipDir
-				}
+			data, rerr := os.ReadFile(fp)
+			if rerr != nil {
+				return nil
+			}
+			relativePath, _ := filepath.Rel(s.root, fp)
+			matches := s.grepLines(string(data), re, relativePath)
+			results = append(results, matches...)
+			total += len(matches)
+			// Stop reading once the cap is met, but the count beyond this point is
+			// now unknown, which the header below reports as a lower bound.
+			if total >= maxResults {
+				return filepath.SkipDir
 			}
 			return nil
 		})
-		if err != nil {
-			return "", fmt.Errorf("walking directory: %s", err.Error())
+		if walkErr != nil {
+			return "", fmt.Errorf("walking directory: %s", walkErr.Error())
 		}
+		skippedNote = renderGrepSkippedNote(skipped)
 	} else {
 		data, err := os.ReadFile(resolved)
 		if err != nil {
 			return "", fmt.Errorf("reading file: %s", err.Error())
 		}
 		relativePath, _ := filepath.Rel(s.root, resolved)
-		results = s.grepLines(string(data), re, caseInsensitive, relativePath)
-		matchCount = len(results)
+		results = s.grepLines(string(data), re, relativePath)
+		total = len(results)
 	}
 
-	if len(results) >= maxResults {
+	if len(results) > maxResults {
 		results = results[:maxResults]
 	}
 
-	output := fmt.Sprintf("grep: %d matches found for pattern %q\n\n", matchCount, pattern)
+	var header string
+	switch {
+	case sawDir && total >= maxResults:
+		// The walk was cut short: the true count is a lower bound, and saying a
+		// precise number would be a lie the caller can't detect.
+		n := maxResults
+		if total > maxResults {
+			n = total
+		}
+		header = fmt.Sprintf("grep: at least %d matches found for pattern %q (showing the first %d — raise max_results or narrow the pattern)",
+			n, pattern, len(results))
+	case total > maxResults:
+		header = fmt.Sprintf("grep: %d matches found for pattern %q (showing the first %d — raise max_results to see the rest)",
+			total, pattern, len(results))
+	default:
+		header = fmt.Sprintf("grep: %d matches found for pattern %q", total, pattern)
+	}
+
+	output := header + "\n\n"
+	if skippedNote != "" {
+		output += skippedNote + "\n\n"
+	}
 	for _, line := range results {
 		output += line + "\n"
 	}
 	return output, nil
 }
 
-func (s *sysTools) grepLines(content string, re *regexp.Regexp, caseInsensitive bool, path string) []string {
+// grepDefaultExtensions bounds the directory walk: reading every file in a
+// large tree is expensive, and tool output lives in these types. The set is
+// reported in the output (and overridable via all_files) so the bound is never
+// invisible to the caller.
+var grepDefaultExtensions = map[string]bool{
+	".go": true, ".js": true, ".ts": true, ".py": true, ".md": true,
+	".json": true, ".yaml": true, ".yml": true, ".toml": true, ".txt": true,
+	".sh": true, ".html": true, ".css": true,
+}
+
+func renderGrepSkippedNote(skipped map[string]int) string {
+	if len(skipped) == 0 {
+		return ""
+	}
+	total := 0
+	names := make([]string, 0, len(skipped))
+	for ext, n := range skipped {
+		total += n
+		names = append(names, ext)
+	}
+	sort.Strings(names)
+	if len(names) > 8 {
+		names = append(names[:8], "...")
+	}
+	return fmt.Sprintf("note: skipped %d file(s) with non-default extensions (%s). "+
+		"Grep one of them by file path, or pass all_files=true to include them", total, strings.Join(names, " "))
+}
+
+func (s *sysTools) grepLines(content string, re *regexp.Regexp, path string) []string {
 	var results []string
 	lines := strings.Split(content, "\n")
 	for i, line := range lines {
-		text := line
-		if caseInsensitive {
-			text = strings.ToLower(text)
-		}
-		if re.MatchString(text) {
+		if re.MatchString(line) {
 			results = append(results, fmt.Sprintf("%s:%d: %s", path, i+1, line))
 		}
 	}

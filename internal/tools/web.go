@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -304,7 +305,7 @@ func (ht *httpTools) parseHTML(ctx context.Context, args map[string]interface{})
 
 	switch mode {
 	case "text":
-		return ht.extractText(doc, args["selectors"]), nil
+		return ht.extractText(doc, args["selectors"])
 	case "headings":
 		return ht.extractHeadings(doc), nil
 	case "links":
@@ -312,13 +313,13 @@ func (ht *httpTools) parseHTML(ctx context.Context, args map[string]interface{})
 	case "meta":
 		return ht.extractMeta(doc), nil
 	case "structure":
-		return ht.extractStructure(doc, args["selectors"]), nil
+		return ht.extractStructure(doc, args["selectors"])
 	default:
 		return "", fmt.Errorf("unknown mode '%s'. Valid modes: text, headings, links, meta, structure", mode)
 	}
 }
 
-func (ht *httpTools) extractText(doc *nethtml.Node, selectorsArg interface{}) string {
+func (ht *httpTools) extractText(doc *nethtml.Node, selectorsArg interface{}) (string, error) {
 	var sb strings.Builder
 	var lastWasSpace bool
 
@@ -349,7 +350,10 @@ func (ht *httpTools) extractText(doc *nethtml.Node, selectorsArg interface{}) st
 				selectorStrs = append(selectorStrs, ss)
 			}
 		}
-		matchingNodes := ht.findNodesBySelector(doc, selectorStrs)
+		matchingNodes, err := ht.findNodesBySelector(doc, selectorStrs)
+		if err != nil {
+			return "", err
+		}
 		for _, node := range matchingNodes {
 			var walkNodeFn func(*nethtml.Node)
 			walkNodeFn = func(n *nethtml.Node) {
@@ -373,7 +377,7 @@ func (ht *httpTools) extractText(doc *nethtml.Node, selectorsArg interface{}) st
 		walk(doc)
 	}
 
-	return strings.TrimSpace(sb.String())
+	return strings.TrimSpace(sb.String()), nil
 }
 
 func isIgnoredNode(n *nethtml.Node) bool {
@@ -500,7 +504,7 @@ func (ht *httpTools) extractMeta(doc *nethtml.Node) string {
 	return strings.TrimSpace(sb.String())
 }
 
-func (ht *httpTools) extractStructure(doc *nethtml.Node, selectorsArg interface{}) string {
+func (ht *httpTools) extractStructure(doc *nethtml.Node, selectorsArg interface{}) (string, error) {
 	var sb strings.Builder
 	var indent int
 
@@ -511,18 +515,21 @@ func (ht *httpTools) extractStructure(doc *nethtml.Node, selectorsArg interface{
 				selectorStrs = append(selectorStrs, ss)
 			}
 		}
-		matchingNodes := ht.findNodesBySelector(doc, selectorStrs)
+		matchingNodes, err := ht.findNodesBySelector(doc, selectorStrs)
+		if err != nil {
+			return "", err
+		}
 		if len(matchingNodes) > 0 {
 			for _, node := range matchingNodes {
 				indent = 0
 				ht.writeStructure(node, &sb, &indent)
 			}
-			return strings.TrimSpace(sb.String())
+			return strings.TrimSpace(sb.String()), nil
 		}
 	}
 
 	ht.writeStructure(doc, &sb, &indent)
-	return strings.TrimSpace(sb.String())
+	return strings.TrimSpace(sb.String()), nil
 }
 
 func (ht *httpTools) writeStructure(n *nethtml.Node, sb *strings.Builder, indent *int) {
@@ -878,7 +885,7 @@ var parseCSSSchema = map[string]interface{}{
 		},
 		"selector": map[string]interface{}{
 			"type":        "string",
-			"description": "CSS selector to match elements. Supports: tag, .class, #id, tag.class, tag#id, tag[attr], tag[attr=val], tag > tag, tag + tag, tag ~ tag, :contains(text)",
+			"description": "CSS selector to match elements. Supports: tag, .class, #id, tag.class, tag#id, tag[attr], tag[attr=val], :contains(text), and the combinators ' ' (descendant), '>' (child), '+' (adjacent sibling), '~' (sibling). Pseudo-classes other than :contains and comma-separated lists are rejected with an error rather than silently matching nothing.",
 		},
 		"attribute": map[string]interface{}{
 			"type":        "string",
@@ -925,7 +932,10 @@ func (ht *httpTools) parseCSS(ctx context.Context, args map[string]interface{}) 
 		return "", fmt.Errorf("selector is required")
 	}
 
-	matchedNodes := ht.querySelectorAll(doc, selector)
+	matchedNodes, err := ht.querySelectorAll(doc, selector)
+	if err != nil {
+		return "", fmt.Errorf("invalid selector %q: %s", selector, err.Error())
+	}
 
 	limit := 50
 	if limitArg, ok := args["limit"].(float64); ok {
@@ -982,30 +992,44 @@ func (ht *httpTools) nodeText(n *nethtml.Node) string {
 
 // --- basic CSS selector matching ---
 
-func (ht *httpTools) findNodesBySelector(root *nethtml.Node, selectors []string) []*nethtml.Node {
-	var results []*nethtml.Node
+func (ht *httpTools) findNodesBySelector(root *nethtml.Node, selectors []string) ([]*nethtml.Node, error) {
+	pm := parentMap(root)
 	allNodes := ht.getAllNodes(root)
+	var results []*nethtml.Node
 
 	for _, sel := range selectors {
+		compounds, combs, err := tokenizeCSS(sel)
+		if err != nil {
+			return nil, err
+		}
 		for _, node := range allNodes {
-			if ht.matchesSelector(node, sel) {
+			if ok, err := ht.matchesSelectorParts(node, compounds, combs, pm); err != nil {
+				return nil, err
+			} else if ok {
 				results = append(results, node)
 			}
 		}
 	}
-	return results
+	return results, nil
 }
 
-func (ht *httpTools) querySelectorAll(root *nethtml.Node, selector string) []*nethtml.Node {
+func (ht *httpTools) querySelectorAll(root *nethtml.Node, selector string) ([]*nethtml.Node, error) {
+	compounds, combs, err := tokenizeCSS(selector)
+	if err != nil {
+		return nil, err
+	}
+	pm := parentMap(root)
 	allNodes := ht.getAllNodes(root)
 	var results []*nethtml.Node
 
 	for _, node := range allNodes {
-		if ht.matchesSelector(node, selector) {
+		if ok, err := ht.matchesSelectorParts(node, compounds, combs, pm); err != nil {
+			return nil, err
+		} else if ok {
 			results = append(results, node)
 		}
 	}
-	return results
+	return results, nil
 }
 
 func (ht *httpTools) getAllNodes(root *nethtml.Node) []*nethtml.Node {
@@ -1021,14 +1045,100 @@ func (ht *httpTools) getAllNodes(root *nethtml.Node) []*nethtml.Node {
 	return nodes
 }
 
-func (ht *httpTools) matchesSelector(node *nethtml.Node, selector string) bool {
-	if node.Type != nethtml.ElementNode {
-		return false
+// parentMap records each node's parent so combinators can look backwards
+// through the tree.
+func parentMap(root *nethtml.Node) map[*nethtml.Node]*nethtml.Node {
+	pm := map[*nethtml.Node]*nethtml.Node{}
+	var walk func(n *nethtml.Node)
+	walk = func(n *nethtml.Node) {
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			pm[c] = n
+			walk(c)
+		}
+	}
+	walk(root)
+	return pm
+}
+
+// scanCompoundEnd returns the end offset of the compound selector starting at
+// start: it runs until a top-level (bracket/paren-balanced) combinator or the
+// end of the selector.
+func scanCompoundEnd(sel string, start int) int {
+	depth := 0
+	for i := start; i < len(sel); i++ {
+		switch sel[i] {
+		case '[', '(':
+			depth++
+		case ']', ')':
+			depth--
+		case ' ', '\t', '>', '+', '~':
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return len(sel)
+}
+
+// tokenizeCSS splits a selector into compound parts and the combinators
+// between them. combs[i] is the combinator after compounds[i] (linking it to
+// compounds[i+1]) and is one of " " (descendant), ">" (child), "+" (adjacent
+// sibling), "~" (sibling). len(combs) == len(compounds)-1.
+func tokenizeCSS(selector string) (compounds []string, combs []string, err error) {
+	sel := strings.TrimSpace(selector)
+	if sel == "" {
+		return nil, nil, errors.New("selector is empty")
+	}
+	if strings.ContainsRune(sel, ',') {
+		return nil, nil, errors.New("comma-separated selector lists are not supported — run one selector per call")
+	}
+	i, n := 0, len(sel)
+	for i < n {
+		for i < n && (sel[i] == ' ' || sel[i] == '\t') {
+			i++
+		}
+		if i >= n {
+			break
+		}
+		start := i
+		i = scanCompoundEnd(sel, start)
+		compound := strings.TrimSpace(sel[start:i])
+		if compound == "" {
+			return nil, nil, fmt.Errorf("malformed selector %q (empty compound)", sel)
+		}
+		compounds = append(compounds, compound)
+		for i < n && (sel[i] == ' ' || sel[i] == '\t') {
+			i++
+		}
+		if i >= n {
+			break
+		}
+		switch sel[i] {
+		case '>', '+', '~':
+			combs = append(combs, string(sel[i]))
+			i++
+		default:
+			combs = append(combs, " ")
+		}
+	}
+	if len(compounds) != len(combs)+1 {
+		return nil, nil, fmt.Errorf("malformed selector %q", sel)
+	}
+	return compounds, combs, nil
+}
+
+// matchCompound matches one compound selector (tag, .class, #id, [attr],
+// :contains) against a node. Anything beyond that supported set is an error,
+// not a silent no-match: "no elements matched" for :nth-child would be read as
+// "the page has no such element", which is a wrong answer dressed as a result.
+func (ht *httpTools) matchCompound(node *nethtml.Node, compound string) (bool, error) {
+	if node == nil || node.Type != nethtml.ElementNode {
+		return false, nil
 	}
 
-	selector = strings.TrimSpace(selector)
-	if selector == "*" {
-		return true
+	compound = strings.TrimSpace(compound)
+	if compound == "*" {
+		return true, nil
 	}
 
 	tag := strings.ToLower(node.Data)
@@ -1038,18 +1148,7 @@ func (ht *httpTools) matchesSelector(node *nethtml.Node, selector string) bool {
 	var id string
 	var attrSelectors []string
 
-	containsText := ""
-	if idx := strings.Index(selector, ":contains("); idx >= 0 {
-		closeIdx := strings.Index(selector[idx:], ")")
-		if closeIdx > 0 {
-			containsText = strings.ToLower(selector[idx+10 : idx+closeIdx])
-			selector = selector[:idx] + selector[idx+closeIdx+1:]
-		}
-	}
-
-	selector = strings.TrimSpace(selector)
-
-	remaining := selector
+	remaining := compound
 	for {
 		bracketStart := strings.Index(remaining, "[")
 		if bracketStart < 0 {
@@ -1064,6 +1163,27 @@ func (ht *httpTools) matchesSelector(node *nethtml.Node, selector string) bool {
 		remaining = remaining[:bracketStart] + remaining[bracketEnd+1:]
 	}
 	remaining = strings.TrimSpace(remaining)
+
+	if idx := strings.Index(remaining, ":"); idx >= 0 {
+		rest := remaining[idx:]
+		if !strings.HasPrefix(rest, ":contains(") {
+			name := rest
+			if end := strings.IndexAny(name, "(, "); end > 0 {
+				name = name[:end]
+			}
+			return false, fmt.Errorf("pseudo-class %q is not supported — only :contains(text) is", strings.TrimSpace(name))
+		}
+		closeIdx := strings.Index(rest, ")")
+		if closeIdx < 0 {
+			return false, fmt.Errorf("unterminated :contains( in %q", compound)
+		}
+		containsText := strings.ToLower(rest[10 : closeIdx])
+		remaining = strings.TrimSpace(remaining[:idx] + rest[closeIdx+1:])
+		nodeText := strings.ToLower(ht.nodeText(node))
+		if !strings.Contains(nodeText, containsText) {
+			return false, nil
+		}
+	}
 
 	var tokens []string
 	var delimiters []rune
@@ -1108,7 +1228,7 @@ func (ht *httpTools) matchesSelector(node *nethtml.Node, selector string) bool {
 	}
 
 	if expectedTag != "" && expectedTag != tag {
-		return false
+		return false, nil
 	}
 
 	for _, c := range classes {
@@ -1124,7 +1244,7 @@ func (ht *httpTools) matchesSelector(node *nethtml.Node, selector string) bool {
 			}
 		}
 		if !hasClass {
-			return false
+			return false, nil
 		}
 	}
 
@@ -1137,7 +1257,7 @@ func (ht *httpTools) matchesSelector(node *nethtml.Node, selector string) bool {
 			}
 		}
 		if !hasID {
-			return false
+			return false, nil
 		}
 	}
 
@@ -1164,18 +1284,70 @@ func (ht *httpTools) matchesSelector(node *nethtml.Node, selector string) bool {
 			}
 		}
 		if !hasAttr {
-			return false
+			return false, nil
 		}
 	}
 
-	if containsText != "" {
-		nodeText := strings.ToLower(ht.nodeText(node))
-		if !strings.Contains(nodeText, containsText) {
-			return false
-		}
+	return true, nil
+}
+
+// matchesSelectorParts matches a full selector: the node against the last
+// compound, then each earlier compound according to its combinator.
+func (ht *httpTools) matchesSelectorParts(node *nethtml.Node, compounds []string, combs []string, pm map[*nethtml.Node]*nethtml.Node) (bool, error) {
+	if ok, err := ht.matchCompound(node, compounds[len(compounds)-1]); err != nil {
+		return false, err
+	} else if !ok {
+		return false, nil
 	}
 
-	return true
+	for i := len(compounds) - 2; i >= 0; i-- {
+		want := compounds[i]
+		switch combs[i] {
+		case ">":
+			if ok, err := ht.matchCompound(pm[node], want); err != nil {
+				return false, err
+			} else if !ok {
+				return false, nil
+			}
+		case " ":
+			found := false
+			for a := pm[node]; a != nil; a = pm[a] {
+				ok, err := ht.matchCompound(a, want)
+				if err != nil {
+					return false, err
+				}
+				if ok {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false, nil
+			}
+		case "+":
+			if ok, err := ht.matchCompound(node.PrevSibling, want); err != nil {
+				return false, err
+			} else if !ok {
+				return false, nil
+			}
+		case "~":
+			found := false
+			for sib := node.PrevSibling; sib != nil; sib = sib.PrevSibling {
+				ok, err := ht.matchCompound(sib, want)
+				if err != nil {
+					return false, err
+				}
+				if ok {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false, nil
+			}
+		}
+	}
+	return true, nil
 }
 
 func truncate(s string, maxLen int) string {
@@ -1216,7 +1388,7 @@ type webSearchTools struct {
 func (ws *webSearchTools) register(r *Registry) {
 	r.Register(&Tool{
 		Name:        "web_search",
-		Description: "Search the web via Ollama. Mode: 'small' returns titles/URLs only (cached), 'full' returns titles/URLs/content snippets, 'raw' returns raw JSON.",
+		Description: "Search the web via Ollama. Mode 'small' returns titles/URLs only; 'full' adds content snippets; 'raw' returns raw JSON. If the live search is unavailable, the last cached result for the query is served and clearly marked as possibly stale.",
 		Schema:      webSearchSchema,
 		ReadOnly:    true,
 		Handler:     ws.webSearch,
@@ -1421,6 +1593,24 @@ func (ws *webSearchTools) cacheSearch(query string, resp *ollamaWebSearchRespons
 	}
 }
 
+// readSearchCache loads a previously cached response for the query. The cache
+// is a resilience fallback, not a fast path: we only read it when the live
+// search failed, and we always tell the caller the data may be stale.
+func (ws *webSearchTools) readSearchCache(query string) (*ollamaWebSearchResponse, error) {
+	if ws.cacheDir() == "" {
+		return nil, os.ErrNotExist
+	}
+	data, err := os.ReadFile(ws.cachePath(query))
+	if err != nil {
+		return nil, err
+	}
+	var resp ollamaWebSearchResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("corrupt cache for %q: %s", query, err.Error())
+	}
+	return &resp, nil
+}
+
 var webSearchSchema = map[string]interface{}{
 	"type": "object",
 	"properties": map[string]interface{}{
@@ -1468,6 +1658,17 @@ func (ws *webSearchTools) webSearch(ctx context.Context, args map[string]interfa
 
 	resp, err := ws.queryOllamaSearch(query, maxResults)
 	if err != nil {
+		// The live search failed (offline, 429/5xx after retries, or the key is
+		// unset). A successful search earlier in the session may be on disk —
+		// serving it beats a hard failure, provided we say plainly that it is
+		// stale and why the fresh one didn't work.
+		if cached, cerr := ws.readSearchCache(query); cerr == nil && len(cached.Results) > 0 {
+			out, ferr := formatSearchResults(query, cached, mode)
+			if ferr != nil {
+				return "", ferr
+			}
+			return fmt.Sprintf("NOTE: live search failed (%s) — the results below are from a previous cached search and may be stale.\n\n%s", err.Error(), out), nil
+		}
 		return "", fmt.Errorf("search failed: %s", err.Error())
 	}
 
@@ -1522,7 +1723,7 @@ func formatSearchResults(query string, resp *ollamaWebSearchResponse, mode strin
 		for i, r := range resp.Results {
 			sb.WriteString(fmt.Sprintf("%d. %s\n   %s\n\n", i+1, r.Title, r.URL))
 		}
-		sb.WriteString("Full results cached to disk. Use mode='full' to get content snippets.\n")
+		sb.WriteString("Titles and URLs only. Use mode='full' to include content snippets.\n")
 		return sb.String(), nil
 	}
 }

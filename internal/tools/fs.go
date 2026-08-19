@@ -230,6 +230,13 @@ func (f *fsTools) readFile(_ context.Context, a map[string]interface{}) (string,
 		return "", fmt.Errorf("reading file: %w", err)
 	}
 
+	// A zero-byte file must not read as "the file is gone" or "nothing to see":
+	// an empty string is indistinguishable from a tool that did nothing. Say what
+	// it actually is.
+	if len(data) == 0 {
+		return fmt.Sprintf("(empty file: %s)", path), nil
+	}
+
 	// Detect binary files by checking for null bytes (>10% => binary).
 	const binaryThreshold = 0.1
 	if len(data) > 0 {
@@ -435,6 +442,11 @@ func (f *fsTools) listDirectory(_ context.Context, a map[string]interface{}) (st
 	entries, err := os.ReadDir(resolved)
 	if err != nil {
 		return "", fmt.Errorf("reading directory: %w", err)
+	}
+	if len(entries) == 0 {
+		// An empty string would read as "the directory is gone" or "the tool did
+		// nothing". An empty directory is a real, reportable state.
+		return fmt.Sprintf("(empty directory: %s)", path), nil
 	}
 	relDir, err := filepath.Rel(f.root, resolved)
 	if err != nil {
