@@ -612,25 +612,23 @@ func htmlToText(h string) string {
 
 // wedgeHosts skip the full-render attempt and go straight to JavaScript-disabled.
 //
-// An explicit list rather than adaptive detection: it is predictable, it costs a known-bad host
-// nothing on the FIRST call (adaptive still pays one timeout), and the list itself documents
-// which sites are broken and why. The cost is that a newly-broken site is slow until someone
-// adds it -- an acceptable trade while the set stays small.
+// EMPTY, and the reason is worth keeping. This list once held huggingface.co,
+// stackoverflow.com and modelscope.cn, which all hung Runtime.evaluate. Three unrelated
+// stacks failing identically was read as "these sites are hostile to headless browsers"
+// -- Hugging Face's SvelteKit hydration markers (<!--[-1-->) even looked like deliberate
+// LLM-delimiter mimicry.
 //
-// Matched as a domain suffix, so "huggingface.co" also covers subdomains.
-// Override with MYMCP_WEDGE_HOSTS (comma-separated); set it empty to disable the list entirely.
-var wedgeHosts = []string{
-	// Surveyed 2026-09-15 across 14 sites an agent would plausibly browse: 3 wedge this
-	// Chromium's renderer (Runtime.evaluate of "1+1" never returns). Three unrelated stacks
-	// failing identically points at the browser, not at the sites. All three are
-	// server-rendered, so JS-off loses only client-fetched sections.
-	//
-	// Working, for contrast: github, wikipedia, news.ycombinator, arxiv, pypi, docs.python.org,
-	// developer.mozilla.org, nvidia, ollama, kaggle -- all returned in under 0.2s.
-	"huggingface.co",
-	"stackoverflow.com", // the costly one: a primary source for a coding agent
-	"modelscope.cn",
-}
+// None of it was true. The browser launched with --headless=new --disable-gpu and no
+// software GL backend, so its renderer could never composite a frame: Page.captureScreenshot
+// waited forever, and any page needing a paint never reached readyState=complete. Adding
+// --use-gl=swiftshader to the launch fixed every site at once -- all five now evaluate in
+// 0.0s. Blocking ads changed nothing, which had already ruled out what was being served.
+//
+// The lesson: a blacklist of sites that break "only for us" is a symptom of a local defect,
+// and each entry postponed finding it. Add a host here only after ruling out this machine.
+//
+// Matched as a domain suffix. Override with MYMCP_WEDGE_HOSTS (comma-separated).
+var wedgeHosts = []string{}
 
 func skipFullRender(rawURL string) bool {
 	hosts := wedgeHosts
