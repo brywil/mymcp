@@ -21,22 +21,13 @@ package tools
 // innocently in articles ABOUT prompt injection, so flagging beats blocking.
 
 import (
-	"encoding/json"
 	"fmt"
-	"net/http"
 	"regexp"
-	"sort"
 	"strings"
-	"sync"
-	"time"
 )
 
 var (
-	// Delimiters are literal strings in a Jinja template; everything else is control flow.
-	delimiterLiteral = regexp.MustCompile(`'([^']{1,60})'|"([^"]{1,60})"`)
-	// Marker shapes worth neutralising: angle tags, ChatML pipe tokens, [INST] brackets.
-	looksStructural = regexp.MustCompile(`^(</?[A-Za-z_][A-Za-z0-9_.-]*[=>]?|<\|[^|]{1,40}\|>|\[/?[A-Z]{2,10}\])$`)
-	inertRewrite    = strings.NewReplacer("<", "⟪", ">", "⟫", "|", "¦")
+	inertRewrite = strings.NewReplacer("<", "⟪", ">", "⟫", "|", "¦")
 )
 
 // fallbackMarkers are used when no chat template could be read. Deliberately broad: without the
@@ -48,89 +39,19 @@ var fallbackMarkers = []string{
 	"<think>", "</think>", "[INST]", "[/INST]",
 }
 
-type delimCache struct {
-	mu      sync.Mutex
-	markers []string
-	fetched time.Time
-	src     string
-}
-
-var delims = &delimCache{}
-
-// DeriveDelimiters extracts structural markers from a chat template, longest-first so replacing a
-// short marker never strands part of a longer one.
-func DeriveDelimiters(chatTemplate string) []string {
-	if strings.TrimSpace(chatTemplate) == "" {
-		return nil
-	}
-	seen := map[string]bool{}
-	for _, m := range delimiterLiteral.FindAllStringSubmatch(chatTemplate, -1) {
-		lit := m[1]
-		if lit == "" {
-			lit = m[2]
-		}
-		for _, cand := range splitTemplateMarkers(lit) {
-			if looksStructural.MatchString(cand) {
-				seen[cand] = true
-			}
-		}
-	}
-	out := make([]string, 0, len(seen))
-	for k := range seen {
-		out = append(out, k)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if len(out[i]) != len(out[j]) {
-			return len(out[i]) > len(out[j])
-		}
-		return out[i] < out[j]
-	})
-	return out
-}
-
-// splitTemplateMarkers pulls candidate markers out of one literal, which often carries a trailing
-// newline or a role name ("<|im_start|>assistant\n").
-func splitTemplateMarkers(lit string) []string {
-	lit = strings.TrimSpace(lit)
-	if lit == "" {
-		return nil
-	}
-	var out []string
-	re := regexp.MustCompile(`</?\|?[A-Za-z_][A-Za-z0-9_.-]*\|?>|\[/?[A-Z]{2,10}\]`)
-	out = append(out, re.FindAllString(lit, -1)...)
-	if len(out) == 0 {
-		out = append(out, lit)
-	}
-	return out
-}
-
-// markersFor returns the marker set for the configured backend, cached for 10 minutes. Falls back
-// to the built-in list when the template cannot be read -- never returns empty.
-func markersFor(llamaURL string) ([]string, string) {
-	delims.mu.Lock()
-	defer delims.mu.Unlock()
-	if time.Since(delims.fetched) < 10*time.Minute && len(delims.markers) > 0 {
-		return delims.markers, delims.src
-	}
-	tpl := ""
-	if llamaURL != "" {
-		base := strings.TrimSuffix(strings.TrimSuffix(llamaURL, "/"), "/v1")
-		c := &http.Client{Timeout: 4 * time.Second}
-		if resp, err := c.Get(base + "/props"); err == nil {
-			defer resp.Body.Close()
-			var props map[string]interface{}
-			if json.NewDecoder(resp.Body).Decode(&props) == nil {
-				tpl, _ = props["chat_template"].(string)
-			}
-		}
-	}
-	m := DeriveDelimiters(tpl)
-	src := "model chat template"
-	if len(m) == 0 {
-		m, src = fallbackMarkers, "built-in fallback (template unavailable)"
-	}
-	delims.markers, delims.src, delims.fetched = m, src, time.Now()
-	return m, src
+// markersFor returns the marker set. mymcp uses a FIXED list on purpose.
+//
+// Deriving markers from the live model would be better, but mymcp cannot: the model servers are
+// on DYNAMICALLY ALLOCATED ports discovered by parsing the systemd units, and goclaw repoints
+// them at runtime via /model. Any URL baked into mymcp's command line is wrong the moment the
+// backend moves -- the same defect that moved analyze_image out of this server.
+//
+// It does not matter much, because goclaw already neutralises every tool result with markers
+// derived from the RUNNING model (internal/handler/handler.go: AddMessage(..., h.neutralize(...))).
+// That is the authoritative pass and it is correct by construction. This one is defence in depth
+// for the common delimiter shapes, so content is already defused before it crosses the boundary.
+func markersFor(_ string) ([]string, string) {
+	return fallbackMarkers, "mymcp built-in list (goclaw re-neutralises with the live model's own)"
 }
 
 // neutralise rewrites structural markers into look-alike, inert text. Returns the cleaned string
@@ -175,8 +96,8 @@ func scanForInjection(s string) []string {
 }
 
 // guardExternal is the single entry point for anything fetched from the open web.
-func guardExternal(s, llamaURL string) string {
-	markers, src := markersFor(llamaURL)
+func guardExternal(s string) string {
+	markers, src := markersFor("")
 	cleaned, defused := neutralise(s, markers)
 	hits := scanForInjection(cleaned)
 	if defused == 0 && len(hits) == 0 {

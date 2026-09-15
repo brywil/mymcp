@@ -63,7 +63,7 @@ serve flags:
   --addr ADDR         listen address (default 127.0.0.1:9443; loopback only)
   --workspace DIR     root the filesystem tools are confined to (default .)
   --allow-exec        enable shell-backed tools: run_command, git, gh, tmux (default true)
-  --llama-url URL     OpenAI-compatible base URL for analyze_image
+  --llama-url URL     deprecated, ignored (ports are discovered from the units by goclaw)
   --llama-model ID    deprecated, ignored (model_info now lives in goclaw)
   --tmux-socket PATH  tmux socket (-S) for tmux tools; empty = default tmux server
   --no-auth           disable bearer auth entirely (open; loopback only)
@@ -93,7 +93,7 @@ func runServe(args []string) error {
 	// Deprecated: analyze_image and model_info both moved to goclaw (they must
 	// follow goclaw's runtime backend switches). Flags still accepted so existing
 	// unit files don't break, but ignored.
-	llamaURL := fs.String("llama-url", "", "OpenAI-compatible backend, used to read the model's chat template so web content sanitisation derives its markers instead of guessing")
+	_ = fs.String("llama-url", "", "deprecated: unused (analyze_image now lives in goclaw)")
 	_ = fs.String("llama-model", "", "deprecated: unused (model_info now lives in goclaw)")
 	tmuxSocket := fs.String("tmux-socket", "", "tmux socket path (-S); empty uses the default tmux server")
 	memoryDir := fs.String("memory-dir", "", "base dir for per-agent memory (<memory-dir>/<token-name>/); empty uses --workspace")
@@ -141,7 +141,6 @@ func runServe(args []string) error {
 
 	reg := tools.NewRegistry()
 	tools.RegisterAll(reg, tools.Config{
-		LlamaURL:    *llamaURL,
 		Workspace:   ws,
 		AllowExec:   *allowExec,
 		ExecTimeout: 120 * time.Second,

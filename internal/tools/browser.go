@@ -43,8 +43,7 @@ const (
 )
 
 type browserMgr struct {
-	cdpURL   string
-	llamaURL string // only for deriving chat-template markers; see sanitize.go
+	cdpURL string
 }
 
 var theBrowser = &browserMgr{cdpURL: defaultCDPURL}
@@ -422,7 +421,7 @@ func (b *browserMgr) inspect(ctx context.Context, args map[string]interface{}) (
 	}
 	if err != nil {
 		if raw, ferr := rawFallback(ctx, url); ferr == nil {
-			return truncateReply(guardExternal(raw, b.llamaURL), maxLen), nil
+			return truncateReply(guardExternal(raw), maxLen), nil
 		}
 		return "", fmt.Errorf("inspect %s: %w", url, err)
 	}
@@ -446,7 +445,7 @@ func (b *browserMgr) inspect(ctx context.Context, args map[string]interface{}) (
 		}
 		body = string(pretty)
 	}
-	return truncateReply(guardExternal(note+body, b.llamaURL), maxLen), nil
+	return truncateReply(guardExternal(note+body), maxLen), nil
 }
 
 // renderScene lays a page out the way dnd-ai-dm renders a room (engine/adapter.py `_scene_text`):
@@ -674,8 +673,7 @@ var webInspectSchema = map[string]interface{}{
 	"required": []string{"url"},
 }
 
-func registerBrowser(r *Registry, llamaURL string) {
-	theBrowser.llamaURL = llamaURL
+func registerBrowser(r *Registry) {
 	r.Register(&Tool{
 		Name: "web_inspect",
 		Description: "Load a page in a real headless browser and inspect its DOM. Unlike web_fetch " +
