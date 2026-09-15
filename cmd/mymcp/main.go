@@ -93,7 +93,7 @@ func runServe(args []string) error {
 	// Deprecated: analyze_image and model_info both moved to goclaw (they must
 	// follow goclaw's runtime backend switches). Flags still accepted so existing
 	// unit files don't break, but ignored.
-	_ = fs.String("llama-url", "", "deprecated: unused (analyze_image now lives in goclaw)")
+	llamaURL := fs.String("llama-url", "", "OpenAI-compatible backend, used to read the model's chat template so web content sanitisation derives its markers instead of guessing")
 	_ = fs.String("llama-model", "", "deprecated: unused (model_info now lives in goclaw)")
 	tmuxSocket := fs.String("tmux-socket", "", "tmux socket path (-S); empty uses the default tmux server")
 	memoryDir := fs.String("memory-dir", "", "base dir for per-agent memory (<memory-dir>/<token-name>/); empty uses --workspace")
@@ -141,6 +141,7 @@ func runServe(args []string) error {
 
 	reg := tools.NewRegistry()
 	tools.RegisterAll(reg, tools.Config{
+		LlamaURL:    *llamaURL,
 		Workspace:   ws,
 		AllowExec:   *allowExec,
 		ExecTimeout: 120 * time.Second,

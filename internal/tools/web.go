@@ -1177,7 +1177,7 @@ func (ht *httpTools) matchCompound(node *nethtml.Node, compound string) (bool, e
 		if closeIdx < 0 {
 			return false, fmt.Errorf("unterminated :contains( in %q", compound)
 		}
-		containsText := strings.ToLower(rest[10 : closeIdx])
+		containsText := strings.ToLower(rest[10:closeIdx])
 		remaining = strings.TrimSpace(remaining[:idx] + rest[closeIdx+1:])
 		nodeText := strings.ToLower(ht.nodeText(node))
 		if !strings.Contains(nodeText, containsText) {

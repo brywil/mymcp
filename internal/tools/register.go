@@ -11,6 +11,10 @@ type Config struct {
 	TmuxSocket  string        // tmux socket path (-S); "" uses the default tmux server
 	MemoryDir   string        // base dir for namespaced memory (<MemoryDir>/<principal>/); "" falls back to Workspace
 	CacheDir    string        // base dir for generated scratch (web_cache, images); "" falls back to Workspace
+	// LlamaURL is the OpenAI-compatible backend. Used ONLY to read the running model's chat
+	// template, so the markers neutralised in fetched web content are derived rather than
+	// guessed (see sanitize.go). Empty falls back to a built-in marker list.
+	LlamaURL string
 }
 
 // RegisterAll registers the full tool catalog into r per cfg.
@@ -39,6 +43,7 @@ func RegisterAll(r *Registry, cfg Config) {
 	(&memoryTools{base: memBase}).register(r)
 	(&httpTools{timeout: cfg.HTTPTimeout}).register(r)
 	(&webSearchTools{root: cfg.Workspace, cache: cfg.CacheDir}).register(r)
+	registerBrowser(r, cfg.LlamaURL)
 	newThinkTools().register(r)
 
 	// Shell-backed groups gated behind AllowExec.
