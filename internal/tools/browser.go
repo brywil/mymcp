@@ -21,11 +21,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
 	"time"
 
+	nethtml "golang.org/x/net/html"
 	"golang.org/x/net/websocket"
 )
 
@@ -86,6 +88,35 @@ type cdpTarget struct {
 // pageTarget returns a websocket URL for a PAGE target, creating one if none exists.
 // Attaching to a non-page target (extension background pages and browser_ui targets are both
 // present in a fresh headless browser) makes Page.* commands hang with no error.
+// newTab creates a DEDICATED tab and returns its ws URL and id. Each call gets its own, because
+// a page that wedges the renderer would otherwise poison every later call through a shared tab.
+// goclaw's web_render already worked this way ("each render gets its own tab"); reusing whatever
+// target happened to exist was my mistake.
+func (b *browserMgr) newTab() (wsURL, id string, err error) {
+	c := &http.Client{Timeout: 8 * time.Second}
+	req, _ := http.NewRequest("PUT", b.endpoint()+"/json/new?about:blank", nil)
+	resp, err := c.Do(req)
+	if err != nil {
+		return "", "", fmt.Errorf("no headless Chromium at %s -- is goclaw-chromium running? (%w)", b.endpoint(), err)
+	}
+	defer resp.Body.Close()
+	var t cdpTarget
+	if err := json.NewDecoder(resp.Body).Decode(&t); err != nil || t.WSURL == "" {
+		return "", "", fmt.Errorf("could not create a page target")
+	}
+	return t.WSURL, t.ID, nil
+}
+
+func (b *browserMgr) closeTab(id string) {
+	if id == "" {
+		return
+	}
+	c := &http.Client{Timeout: 5 * time.Second}
+	if resp, err := c.Get(b.endpoint() + "/json/close/" + id); err == nil {
+		resp.Body.Close()
+	}
+}
+
 func (b *browserMgr) pageTarget() (string, error) {
 	c := &http.Client{Timeout: 5 * time.Second}
 	resp, err := c.Get(b.endpoint() + "/json")
@@ -166,24 +197,57 @@ func (c *cdpConn) call(ctx context.Context, method string, params map[string]int
 	}
 }
 
-// evalOnPage navigates to url and evaluates js, returning its JSON-serialisable value.
+// evalOnPage navigates a DEDICATED tab to url and evaluates js.
+//
+// Every CDP call is bounded. Measured 2026-09-15: on huggingface.co this Chromium (152, aarch64)
+// wedges its RENDERER -- network events keep flowing and Page.frameNavigated fires, but
+// Page.loadEventFired never does and both DOM.getDocument and Runtime.evaluate of "1+1" hang
+// forever. Wikipedia and GitHub are fine. An unbounded wait would hang the agent's whole turn, so
+// the budget is what makes the fallback in inspect() reachable.
 func evalOnPage(ctx context.Context, url, js string, waitMS int) (interface{}, error) {
-	if _, err := theBrowser.version(); err != nil {
-		return nil, err
-	}
-	wsURL, err := theBrowser.pageTarget()
+	return evalOnPageMode(ctx, url, js, waitMS, false)
+}
+
+// evalOnPageMode runs the extractor, optionally with JavaScript execution disabled.
+//
+// JS-off is the FIRST fallback, not the last. Measured 2026-09-15: huggingface.co (homepage and
+// model pages alike) wedges this Chromium's renderer -- Runtime.evaluate of "1+1" never returns --
+// but with Emulation.setScriptExecutionDisabled the same page reaches readyState "complete" and
+// extracts fully. It is not bot detection: spoofing a normal user-agent changes nothing, and no
+// crash event fires. Something in their bundle blocks the renderer on aarch64.
+//
+// For a server-rendered site this costs almost nothing, which is why it beats dropping straight
+// to raw HTML: the DOM is real, so outline/query/links still work properly.
+func evalOnPageMode(ctx context.Context, url, js string, waitMS int, noJS bool) (interface{}, error) {
+	wsURL, tabID, err := theBrowser.newTab()
 	if err != nil {
 		return nil, err
 	}
+	defer theBrowser.closeTab(tabID)
+
 	conn, err := dialCDP(wsURL)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.close()
-	if _, err := conn.call(ctx, "Page.enable", nil); err != nil {
+
+	budget := 25 * time.Second
+	if d, ok := ctx.Deadline(); ok && time.Until(d) < budget {
+		budget = time.Until(d)
+	}
+	bctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+
+	if _, err := conn.call(bctx, "Page.enable", nil); err != nil {
 		return nil, err
 	}
-	if _, err := conn.call(ctx, "Page.navigate", map[string]interface{}{"url": url}); err != nil {
+	if noJS {
+		if _, err := conn.call(bctx, "Emulation.setScriptExecutionDisabled",
+			map[string]interface{}{"value": true}); err != nil {
+			return nil, err
+		}
+	}
+	if _, err := conn.call(bctx, "Page.navigate", map[string]interface{}{"url": url}); err != nil {
 		return nil, err
 	}
 	if waitMS <= 0 {
@@ -191,10 +255,10 @@ func evalOnPage(ctx context.Context, url, js string, waitMS int) (interface{}, e
 	}
 	select {
 	case <-time.After(time.Duration(waitMS) * time.Millisecond):
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	case <-bctx.Done():
+		return nil, fmt.Errorf("renderer never settled")
 	}
-	res, err := conn.call(ctx, "Runtime.evaluate", map[string]interface{}{
+	res, err := conn.call(bctx, "Runtime.evaluate", map[string]interface{}{
 		"expression": js, "returnByValue": true, "awaitPromise": true})
 	if err != nil {
 		return nil, err
@@ -333,8 +397,21 @@ func (b *browserMgr) inspect(ctx context.Context, args map[string]interface{}) (
 		return "", fmt.Errorf("unknown mode %q (outline|text|links|query)", mode)
 	}
 
+	// Degrade in stages rather than failing: full render -> JS disabled -> raw HTML. Each step
+	// loses something specific and the reply says which one produced it.
+	note := ""
 	val, err := evalOnPage(ctx, url, js, waitMS)
 	if err != nil {
+		val, err = evalOnPageMode(ctx, url, js, waitMS, true)
+		if err == nil {
+			note = "[rendered with JAVASCRIPT DISABLED -- the page wedged this browser's renderer. " +
+				"Server-rendered content is complete; anything built client-side is missing.]\n\n"
+		}
+	}
+	if err != nil {
+		if raw, ferr := rawFallback(ctx, url); ferr == nil {
+			return truncateReply(guardExternal(raw, b.llamaURL), maxLen), nil
+		}
 		return "", fmt.Errorf("inspect %s: %w", url, err)
 	}
 	// EVERYTHING below this line is attacker-controlled. One guarded exit, so a future mode
@@ -357,7 +434,7 @@ func (b *browserMgr) inspect(ctx context.Context, args map[string]interface{}) (
 		}
 		body = string(pretty)
 	}
-	return truncateReply(guardExternal(body, b.llamaURL), maxLen), nil
+	return truncateReply(guardExternal(note+body, b.llamaURL), maxLen), nil
 }
 
 // renderScene lays a page out the way dnd-ai-dm renders a room (engine/adapter.py `_scene_text`):
@@ -464,6 +541,62 @@ func renderScene(m map[string]interface{}) string {
 func arr2(m map[string]interface{}, k string) []interface{} {
 	v, _ := m[k].([]interface{})
 	return v
+}
+
+// rawFallback fetches the URL over plain HTTP and extracts text, for when the renderer wedges.
+//
+// This is not a lesser mode by accident -- it is the SAME trade web_fetch already documents: the
+// page a browser cannot render is often one a plain GET returns in full. huggingface.co is exactly
+// that case here: Chromium 152 hangs its renderer on it while curl returns 200 and 237 KB.
+// The reply says WHICH path produced it, because "no JavaScript ran" changes how much to trust it.
+func rawFallback(ctx context.Context, url string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; mymcp web_inspect)")
+	resp, err := (&http.Client{Timeout: 25 * time.Second}).Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return "", err
+	}
+	text := htmlToText(string(body))
+	return fmt.Sprintf("[served from RAW HTML -- the browser's renderer did not respond, so NO "+
+		"JavaScript ran. Content built client-side will be missing.]\nHTTP %d  %s\n\n%s",
+		resp.StatusCode, url, text), nil
+}
+
+// htmlToText extracts visible text with a REAL HTML parse.
+//
+// The hand-rolled tag-stripper this replaces leaked attribute content, which on huggingface.co
+// meant 40 KB of page-state JSON -- including the model's entire Jinja chat template -- landing
+// in the reply. That also produced false injection warnings, because the template legitimately
+// contains "do not tell the user about function calls". Walking TEXT NODES cannot make that
+// mistake: attribute values are never text nodes.
+func htmlToText(h string) string {
+	doc, err := nethtml.Parse(strings.NewReader(h))
+	if err != nil {
+		return ""
+	}
+	var sb strings.Builder
+	var walk func(*nethtml.Node)
+	walk = func(n *nethtml.Node) {
+		if n.Type == nethtml.TextNode {
+			if t := strings.TrimSpace(n.Data); t != "" && !isIgnoredNode(n) {
+				sb.WriteString(t)
+				sb.WriteString(" ")
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(doc)
+	return strings.Join(strings.Fields(sb.String()), " ")
 }
 
 var webInspectSchema = map[string]interface{}{
