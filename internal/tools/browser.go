@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"strings"
 	"time"
@@ -400,10 +401,21 @@ func (b *browserMgr) inspect(ctx context.Context, args map[string]interface{}) (
 	// Degrade in stages rather than failing: full render -> JS disabled -> raw HTML. Each step
 	// loses something specific and the reply says which one produced it.
 	note := ""
-	val, err := evalOnPage(ctx, url, js, waitMS)
-	if err != nil {
+	var val interface{}
+	var err error
+	if skipFullRender(url) {
+		// Known-wedging host: do not spend the full-render timeout rediscovering it.
 		val, err = evalOnPageMode(ctx, url, js, waitMS, true)
 		if err == nil {
+			note = "[rendered with JAVASCRIPT DISABLED -- this host is on the known-wedging list. " +
+				"Server-rendered content is complete; anything built client-side is missing.]\n\n"
+		}
+	} else {
+		val, err = evalOnPage(ctx, url, js, waitMS)
+	}
+	if err != nil {
+		val, err = evalOnPageMode(ctx, url, js, waitMS, true)
+		if err == nil && note == "" {
 			note = "[rendered with JAVASCRIPT DISABLED -- the page wedged this browser's renderer. " +
 				"Server-rendered content is complete; anything built client-side is missing.]\n\n"
 		}
@@ -597,6 +609,52 @@ func htmlToText(h string) string {
 	}
 	walk(doc)
 	return strings.Join(strings.Fields(sb.String()), " ")
+}
+
+// wedgeHosts skip the full-render attempt and go straight to JavaScript-disabled.
+//
+// An explicit list rather than adaptive detection: it is predictable, it costs a known-bad host
+// nothing on the FIRST call (adaptive still pays one timeout), and the list itself documents
+// which sites are broken and why. The cost is that a newly-broken site is slow until someone
+// adds it -- an acceptable trade while the set stays small.
+//
+// Matched as a domain suffix, so "huggingface.co" also covers subdomains.
+// Override with MYMCP_WEDGE_HOSTS (comma-separated); set it empty to disable the list entirely.
+var wedgeHosts = []string{
+	// Surveyed 2026-09-15 across 14 sites an agent would plausibly browse: 3 wedge this
+	// Chromium's renderer (Runtime.evaluate of "1+1" never returns). Three unrelated stacks
+	// failing identically points at the browser, not at the sites. All three are
+	// server-rendered, so JS-off loses only client-fetched sections.
+	//
+	// Working, for contrast: github, wikipedia, news.ycombinator, arxiv, pypi, docs.python.org,
+	// developer.mozilla.org, nvidia, ollama, kaggle -- all returned in under 0.2s.
+	"huggingface.co",
+	"stackoverflow.com", // the costly one: a primary source for a coding agent
+	"modelscope.cn",
+}
+
+func skipFullRender(rawURL string) bool {
+	hosts := wedgeHosts
+	if v, ok := os.LookupEnv("MYMCP_WEDGE_HOSTS"); ok {
+		hosts = nil
+		for _, h := range strings.Split(v, ",") {
+			if h = strings.TrimSpace(h); h != "" {
+				hosts = append(hosts, h)
+			}
+		}
+	}
+	u, err := neturl.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	for _, h := range hosts {
+		h = strings.ToLower(h)
+		if host == h || strings.HasSuffix(host, "."+h) {
+			return true
+		}
+	}
+	return false
 }
 
 var webInspectSchema = map[string]interface{}{
