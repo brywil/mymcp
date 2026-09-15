@@ -1401,8 +1401,8 @@ type webSearchTools struct {
 
 func (ws *webSearchTools) register(r *Registry) {
 	r.Register(&Tool{
-		Name:        "web_search",
-		Description: "Search the web via Ollama. Mode 'small' returns titles/URLs only; 'full' adds content snippets; 'raw' returns raw JSON. If the live search is unavailable, the last cached result for the query is served and clearly marked as possibly stale.",
+		Name:        "web_search_paid",
+		Description: "PAID — each query spends real money on the Ollama cloud API. Prefer web_search_free (free, browser-backed) and use this only when that fails or its results are insufficient. Mode 'small' returns titles/URLs only; 'full' adds content snippets; 'raw' returns raw JSON. If the live search is unavailable, the last cached result for the query is served and clearly marked as possibly stale.",
 		Schema:      webSearchSchema,
 		ReadOnly:    true,
 		Handler:     ws.webSearch,

@@ -40,6 +40,7 @@ func RegisterAll(r *Registry, cfg Config) {
 	(&httpTools{timeout: cfg.HTTPTimeout}).register(r)
 	(&webSearchTools{root: cfg.Workspace, cache: cfg.CacheDir}).register(r)
 	registerBrowser(r)
+	registerWebSearchFree(r)
 	newThinkTools().register(r)
 
 	// Shell-backed groups gated behind AllowExec.
