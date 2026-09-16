@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/brywil/mymcp/internal/mcp"
@@ -160,6 +161,15 @@ func runServe(args []string) error {
 	noAuth := fs.Bool("no-auth", false, "disable bearer auth (open server; loopback only)")
 	allowRemote := fs.Bool("allow-remote", false, "permit binding a non-loopback address")
 	_ = fs.Parse(args)
+
+	// Also settable from the environment, because the systemd unit is shared across machines
+	// while the bind address is per-machine. Expanding a flag from an EnvironmentFile instead
+	// (--allow-remote=${ALLOW_REMOTE}) breaks every install that lacks the var: systemd expands
+	// it to "--allow-remote=", which flag.Bool rejects, and the server refuses to start.
+	// An unset env var is simply false.
+	if v := os.Getenv("MYMCP_ALLOW_REMOTE"); v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes") {
+		*allowRemote = true
+	}
 
 	ws, err := filepath.Abs(*workspace)
 	if err != nil {
