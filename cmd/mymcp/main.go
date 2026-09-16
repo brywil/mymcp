@@ -6,6 +6,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -34,6 +35,8 @@ func main() {
 		err = runServe(os.Args[2:])
 	case "token":
 		err = runToken(os.Args[2:])
+	case "check-browser":
+		err = runCheckBrowser(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -58,6 +61,7 @@ usage:
   mymcp token list              list token names
   mymcp token show <name>       print a token's value
   mymcp token revoke <name>     delete a token
+  mymcp check-browser           verify the headless browser end to end, and say what to fix
 
 serve flags:
   --addr ADDR         listen address (default 127.0.0.1:9443; loopback only)
@@ -74,6 +78,61 @@ file or "mymcp token revoke <name>". Each request is logged with the matching
 token name. For LAN/remote, keep mymcp on loopback and front it with mTLS:
   truemtls serve --backend http://127.0.0.1:9443 --listen 0.0.0.0:8443
 `)
+}
+
+// runCheckBrowser is the install-time and debugging entry point for the browser stack.
+// Exit 0 means web_inspect / web_search_free / screenshots all work; non-zero names the
+// first broken layer and the fix.
+func runCheckBrowser(args []string) error {
+	fs := flag.NewFlagSet("check-browser", flag.ExitOnError)
+	endpoint := fs.String("cdp-url", "", "DevTools endpoint (default $MYMCP_CDP_URL or http://127.0.0.1:9222)")
+	_ = fs.Parse(args)
+
+	ep := *endpoint
+	if ep == "" {
+		ep = os.Getenv("MYMCP_CDP_URL")
+	}
+	if ep == "" {
+		ep = "http://127.0.0.1:9222"
+	}
+	fmt.Printf("mymcp check-browser -> %s\n\n", ep)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	report, ok := tools.FormatPreflight(tools.Preflight(ctx, ep))
+	fmt.Print(report)
+	if !ok {
+		return fmt.Errorf("browser preflight failed")
+	}
+	return nil
+}
+
+// logBrowserHealth reports the browser stack once at startup, in the background and never
+// fatally: the file, shell and memory tools must come up whether or not a browser exists.
+// It runs because the browser tools otherwise fail only at CALL time, with an error that
+// says nothing about which layer broke -- and a fresh install has no browser at all.
+func logBrowserHealth() {
+	ep := os.Getenv("MYMCP_CDP_URL")
+	if ep == "" {
+		ep = "http://127.0.0.1:9222"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	stages := tools.Preflight(ctx, ep)
+	if _, ok := tools.FormatPreflight(stages); ok {
+		log.Printf("[BROWSER] %s: healthy (DOM + screenshots)", ep)
+		return
+	}
+	var first tools.PreflightStage
+	for _, st := range stages {
+		if !st.OK {
+			first = st
+			break
+		}
+	}
+	log.Printf("[BROWSER] %s: DEGRADED at stage %q (%s). Browser-backed tools "+
+		"(web_inspect, web_search_free, screenshots) will fail until this is fixed; "+
+		"run `mymcp check-browser` for the remedy.", ep, first.Name, first.Detail)
 }
 
 func defaultConfigDir() string {
@@ -157,6 +216,7 @@ func runServe(args []string) error {
 	if authenticate != nil {
 		log.Printf("retrieve a token for your MCP client with: mymcp token")
 	}
+	go logBrowserHealth()
 	return (&http.Server{Addr: *addr, Handler: srv}).ListenAndServe()
 }
 

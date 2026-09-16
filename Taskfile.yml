@@ -105,6 +105,12 @@ tasks:
     cmds:
       - "{{.XDG}} journalctl --user -u {{.SERVICE}}.service -f"
 
+  check-browser:
+    desc: "Verify the headless browser the web tools need, and print the fix if it is broken"
+    deps: [build]
+    cmds:
+      - ./build/mymcp check-browser
+
   install-unit:
     desc: "Install the mymcp systemd --user service (no sudo); enables but does not start"
     deps: [install]
@@ -125,6 +131,7 @@ tasks:
       - "{{.XDG}} systemctl --user daemon-reload"
       - "{{.XDG}} systemctl --user enable mymcp.service"
       - 'echo "Edit {{.CFG_DIR}}/mymcp.env (WORKSPACE, ADDR), then: systemctl --user start mymcp"'
+      - 'echo "Web tools need a headless browser on 127.0.0.1:9222. Verify with: task check-browser"'
 
   uninstall-unit:
     desc: "Stop, disable, and remove the mymcp user service (keeps config + trust)"
