@@ -68,6 +68,10 @@ serve flags:
   --addr ADDR         listen address (default 127.0.0.1:9443; loopback only)
   --workspace DIR     root the filesystem tools are confined to (default .)
   --allow-exec        enable shell-backed tools: run_command, git, gh, tmux (default true)
+  --tools LIST        comma-separated whitelist of tools to expose. Accepts the
+                      words 'all' and 'ro' (every ReadOnly tool) alongside
+                      explicit names, e.g. --tools ro,memory_save
+                      Enforced on dispatch, not just on the listing.
   --llama-url URL     deprecated, ignored (ports are discovered from the units by goclaw)
   --llama-model ID    deprecated, ignored (model_info now lives in goclaw)
   --tmux-socket PATH  tmux socket (-S) for tmux tools; empty = default tmux server
@@ -150,6 +154,7 @@ func runServe(args []string) error {
 	addr := fs.String("addr", "127.0.0.1:9443", "listen address (loopback only unless --allow-remote)")
 	workspace := fs.String("workspace", ".", "root directory the filesystem tools are confined to")
 	allowExec := fs.Bool("allow-exec", true, "enable shell-backed tools (run_command, git, gh, tmux)")
+	toolList := fs.String("tools", "", "comma-separated whitelist of tools to expose; also accepts the words 'all' and 'ro'. Empty = all")
 	// Deprecated: analyze_image and model_info both moved to goclaw (they must
 	// follow goclaw's runtime backend switches). Flags still accepted so existing
 	// unit files don't break, but ignored.
@@ -217,12 +222,28 @@ func runServe(args []string) error {
 		MemoryDir:   *memoryDir,
 		CacheDir:    cache,
 	})
+	// Restrict BEFORE the server is constructed, so there is no window in which
+	// the full catalog is reachable.
+	exposed := reg.Count()
+	if strings.TrimSpace(*toolList) != "" {
+		names, err := tools.ResolveTools(reg, []string{*toolList})
+		if err != nil {
+			log.Fatalf("mymcp: %v", err)
+		}
+		if len(names) == 0 {
+			log.Fatalf("mymcp: --tools %q selected nothing; refusing to start (use --tools all for the full catalog)", *toolList)
+		}
+		reg.Restrict(names)
+		exposed = len(names)
+		log.Printf("mymcp: exposing %d of %d tools: %s", exposed, reg.Count(), strings.Join(names, " "))
+	}
+
 	srv := mcp.NewServer(mcp.Options{Tools: reg, Authenticate: authenticate, ServerName: "mymcp", Version: version})
 
 	if *allowRemote && !isLoopback(host) && *noAuth {
 		log.Printf("mymcp %s: WARNING — unauthenticated server on http://%s; anyone who can reach it gets RCE", version, *addr)
 	}
-	log.Printf("mymcp %s: MCP server on http://%s  (workspace=%s, tools=%d, exec=%v, auth=%s)", version, *addr, ws, reg.Count(), *allowExec, authLabel)
+	log.Printf("mymcp %s: MCP server on http://%s  (workspace=%s, tools=%d, exec=%v, auth=%s)", version, *addr, ws, exposed, *allowExec, authLabel)
 	if authenticate != nil {
 		log.Printf("retrieve a token for your MCP client with: mymcp token")
 	}

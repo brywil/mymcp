@@ -25,6 +25,10 @@ type Tool struct {
 type Registry struct {
 	order []string
 	tools map[string]*Tool
+
+	// visible, when non-nil, is the set of tool names this registry exposes.
+	// nil means everything, which is the default and the existing behaviour.
+	visible map[string]bool
 }
 
 // NewRegistry returns an empty Registry.
@@ -49,10 +53,50 @@ func (r *Registry) ReadOnly(name string) bool {
 	return false
 }
 
+// Restrict limits the registry to the named tools.
+//
+// Applied to BOTH ListTools and CallTool on purpose. Filtering only the listing
+// would be security theatre: the catalog is a hint, and a model that has seen a
+// tool name once — in its own earlier context, or in any other transcript — can
+// simply ask for it. The dispatch path is the only place a restriction means
+// anything.
+//
+// A nil or empty set is rejected rather than silently exposing everything: the
+// caller asking for "no tools" and getting all 75 is precisely the failure this
+// exists to prevent.
+func (r *Registry) Restrict(names []string) {
+	v := make(map[string]bool, len(names))
+	for _, n := range names {
+		if _, ok := r.tools[n]; ok {
+			v[n] = true
+		}
+	}
+	r.visible = v
+}
+
+// Visible reports whether a tool is exposed under the current restriction.
+func (r *Registry) Visible(name string) bool {
+	if r.visible == nil {
+		return true
+	}
+	return r.visible[name]
+}
+
+// Names returns every registered tool name, in registration order, regardless
+// of restriction. Used to resolve presets before Restrict is applied.
+func (r *Registry) Names() []string {
+	out := make([]string, len(r.order))
+	copy(out, r.order)
+	return out
+}
+
 // ListTools implements mcp.ToolProvider.
 func (r *Registry) ListTools() []mcp.ToolDef {
 	defs := make([]mcp.ToolDef, 0, len(r.order))
 	for _, name := range r.order {
+		if !r.Visible(name) {
+			continue
+		}
 		t := r.tools[name]
 		schema := t.Schema
 		if schema == nil {
@@ -66,6 +110,10 @@ func (r *Registry) ListTools() []mcp.ToolDef {
 // CallTool implements mcp.ToolProvider. A handler error is reported as an MCP
 // tool error (isError=true) rather than a protocol error.
 func (r *Registry) CallTool(ctx context.Context, name string, args map[string]interface{}) (string, bool) {
+	// Enforced here, not only in the listing — see Restrict.
+	if !r.Visible(name) {
+		return "tool not available: " + name, true
+	}
 	t, ok := r.tools[name]
 	if !ok {
 		return "unknown tool: " + name, true
