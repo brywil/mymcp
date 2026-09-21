@@ -1024,8 +1024,8 @@ func (mt *memoryTools) register(r *Registry) {
 	})
 	r.Register(&Tool{
 		Name:        "memory_search",
-		Description: "Search your long-term memory (MEMORY.md and memory/*.md) for a keyword and return matching lines. Use before answering questions about prior context.",
-		Schema:      obj(map[string]interface{}{"query": strProp("Keyword or phrase to search for")}, "query"),
+		Description: "Search your long-term memory (MEMORY.md and memory/*.md) and return matching lines. Matches LITERAL text within a single line, so search one distinctive word rather than a question or a sentence; several words match only a line containing all of them. Use before answering questions about prior context.",
+		Schema:      obj(map[string]interface{}{"query": strProp("One distinctive word works best. Not a question or a sentence: this is a literal text match, not a semantic search.")}, "query"),
 		ReadOnly:    true,
 		Handler:     mt.search,
 	})
@@ -1143,6 +1143,15 @@ func (mt *memoryTools) search(ctx context.Context, args map[string]interface{}) 
 		return "", errors.New("query is required and must be a non-empty string")
 	}
 	lowerQuery := strings.ToLower(query)
+	// Punctuation is stripped from the terms, or a query ending in "?" reports the last word
+	// as absent when the word itself is present -- a hint that is worse than no hint, because
+	// it sends the caller looking for the wrong thing.
+	var terms []string
+	for _, t := range strings.Fields(lowerQuery) {
+		if t = strings.Trim(t, `?.,!;:"'()[]`); t != "" {
+			terms = append(terms, t)
+		}
+	}
 	workspace, err := mt.dir(ctx)
 	if err != nil {
 		return "", err
@@ -1190,14 +1199,59 @@ func (mt *memoryTools) search(ctx context.Context, args map[string]interface{}) 
 		for scanner.Scan() {
 			lineNum++
 			line := scanner.Text()
-			if strings.Contains(strings.ToLower(line), lowerQuery) {
+			lower := strings.ToLower(line)
+			if strings.Contains(lower, lowerQuery) {
+				allMatches = append(allMatches, match{file: filePath, lineNum: lineNum, line: line})
+				continue
+			}
+			// FALL BACK TO ALL-TERMS when the phrase itself is not on any one line.
+			//
+			// The exact-substring match is right when it hits and useless when it misses, and
+			// it misses on anything phrased as a question or a description -- which is how a
+			// model naturally searches, and what the description ("keyword or phrase") invites.
+			// Observed: an assistant asked its memory for "tools testing plan one at a time"
+			// and for "What tools do I have?" and got nothing both times, while "tools" alone
+			// returned four lines that answered it. It concluded it could not work the tool.
+			//
+			// Requiring every term rather than any keeps precision: an ordinary sentence of a
+			// query still will not match, which is correct, and the report below says why.
+			if len(terms) > 1 && containsAll(lower, terms) {
 				allMatches = append(allMatches, match{file: filePath, lineNum: lineNum, line: line})
 			}
 		}
 	}
 
 	if len(allMatches) == 0 {
-		return fmt.Sprintf("No matches found for query: %q", query), nil
+		// A bare "no matches" is a dead end: it does not say whether the memory is empty, the
+		// wording is wrong, or the tool works differently than assumed. Reporting which terms
+		// DO appear turns it into a next step, which is the difference between a caller
+		// retrying usefully and one concluding the tool is broken.
+		if len(terms) > 1 {
+			var present, absent []string
+			for _, t := range terms {
+				if termHits(filePaths, t) > 0 {
+					present = append(present, t)
+				} else {
+					absent = append(absent, t)
+				}
+			}
+			var sb strings.Builder
+			fmt.Fprintf(&sb, "No line contains all of %q.\n", query)
+			sb.WriteString("This searches for LITERAL text within a single line, so a question " +
+				"or a description will not match; search one distinctive word instead.\n")
+			if len(present) > 0 {
+				fmt.Fprintf(&sb, "These terms DO appear, and are worth searching alone: %s\n",
+					strings.Join(present, ", "))
+			}
+			if len(absent) > 0 {
+				fmt.Fprintf(&sb, "These appear nowhere in memory: %s\n", strings.Join(absent, ", "))
+			}
+			sb.WriteString("memory_read with no arguments returns the whole index if you would " +
+				"rather read it than search it.")
+			return strings.TrimRight(sb.String(), "\n"), nil
+		}
+		return fmt.Sprintf("No matches found for query: %q. This searches for literal text "+
+			"within a single line; memory_read returns the whole index.", query), nil
 	}
 
 	var sb strings.Builder
@@ -1294,4 +1348,31 @@ func (mt *memoryTools) list(ctx context.Context, _ map[string]interface{}) (stri
 		}
 	}
 	return sb.String(), nil
+}
+
+// containsAll reports whether every term appears somewhere in the line.
+func containsAll(lowerLine string, terms []string) bool {
+	for _, t := range terms {
+		if !strings.Contains(lowerLine, t) {
+			return false
+		}
+	}
+	return true
+}
+
+// termHits counts lines containing one term, for the "these words DO appear" hint.
+func termHits(paths []string, term string) int {
+	n := 0
+	for _, p := range paths {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(strings.ToLower(string(data)), "\n") {
+			if strings.Contains(line, term) {
+				n++
+			}
+		}
+	}
+	return n
 }
