@@ -32,6 +32,8 @@ func RegisterAll(r *Registry, cfg Config) {
 	(&fsTools{root: cfg.Workspace, cache: cfg.CacheDir}).register(r)
 	(&sysTools{root: cfg.Workspace}).register(r)
 	(&miscTools{}).register(r)
+	// Closes over r so it reports what this instance actually exposes, after Restrict.
+	registerListTools(r)
 	memBase := cfg.MemoryDir
 	if memBase == "" {
 		memBase = cfg.Workspace
