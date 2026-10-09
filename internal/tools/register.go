@@ -1,6 +1,9 @@
 package tools
 
-import "time"
+import (
+	"log"
+	"time"
+)
 
 // Config controls which tools are registered and how they behave.
 type Config struct {
@@ -11,6 +14,10 @@ type Config struct {
 	TmuxSocket  string        // tmux socket path (-S); "" uses the default tmux server
 	MemoryDir   string        // base dir for namespaced memory (<MemoryDir>/<principal>/); "" falls back to Workspace
 	CacheDir    string        // base dir for generated scratch (web_cache, images); "" falls back to Workspace
+	// RecallSource enables the recall tool: "goclaw:<archive dir>" or "voicebox:<sessions dir>" ("" = no recall).
+	// One source per instance, so each assistant searches only its own history.
+	RecallSource string
+	EmbedURL     string // goclaw-embed; "" = http://127.0.0.1:8089
 }
 
 // RegisterAll registers the full tool catalog into r per cfg.
@@ -45,6 +52,17 @@ func RegisterAll(r *Registry, cfg Config) {
 	registerWebSearchFree(r)
 	registerBrowserHealth(r)
 	newThinkTools().register(r)
+	if cfg.RecallSource != "" {
+		cache := cfg.CacheDir
+		if cache == "" {
+			cache = cfg.Workspace
+		}
+		if rt, err := newRecallTools(cfg.RecallSource, cfg.EmbedURL, cache); err != nil {
+			log.Printf("recall disabled: %v", err)
+		} else {
+			rt.register(r)
+		}
+	}
 
 	// Shell-backed groups gated behind AllowExec.
 	if cfg.AllowExec {

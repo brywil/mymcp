@@ -163,6 +163,8 @@ func runServe(args []string) error {
 	tmuxSocket := fs.String("tmux-socket", "", "tmux socket path (-S); empty uses the default tmux server")
 	memoryDir := fs.String("memory-dir", "", "base dir for per-agent memory (<memory-dir>/<token-name>/); empty uses --workspace")
 	cacheDir := fs.String("cache-dir", "", "base dir for generated scratch (web_cache, images); empty uses the OS cache dir (~/.cache/mymcp)")
+	recallSource := fs.String("recall-source", "", "enable the recall tool over one conversation history: goclaw:<archive dir> or voicebox:<sessions dir>")
+	embedURL := fs.String("embed-url", "", "goclaw-embed URL for recall (default http://127.0.0.1:8089)")
 	noAuth := fs.Bool("no-auth", false, "disable bearer auth (open server; loopback only)")
 	allowRemote := fs.Bool("allow-remote", false, "permit binding a non-loopback address")
 	_ = fs.Parse(args)
@@ -215,12 +217,14 @@ func runServe(args []string) error {
 
 	reg := tools.NewRegistry()
 	tools.RegisterAll(reg, tools.Config{
-		Workspace:   ws,
-		AllowExec:   *allowExec,
-		ExecTimeout: 120 * time.Second,
-		TmuxSocket:  *tmuxSocket,
-		MemoryDir:   *memoryDir,
-		CacheDir:    cache,
+		Workspace:    ws,
+		AllowExec:    *allowExec,
+		ExecTimeout:  120 * time.Second,
+		TmuxSocket:   *tmuxSocket,
+		MemoryDir:    *memoryDir,
+		CacheDir:     cache,
+		RecallSource: *recallSource,
+		EmbedURL:     *embedURL,
 	})
 	// Restrict BEFORE the server is constructed, so there is no window in which
 	// the full catalog is reachable.
