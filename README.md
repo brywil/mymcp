@@ -6,21 +6,51 @@ utilities, and tmux/`run_command`) to any MCP client over plain HTTP on loopback
 with an optional **bearer token**. Go stdlib plus a single dependency
 (`golang.org/x/net/html`, for the `parse_html`/`parse_css` tools).
 
+> **New to MCP?** Start with [What is MCP? Where does mymcp fit?](docs/WHAT_IS_MCP.md)
+> — it explains LLMs, harnesses (goclaw, Claude Code, etc.), and MCP clients/servers
+> without assuming prior knowledge.
+
 This is goclaw's host-tool backend: goclaw mounts these tools over MCP under
 their bare names, so they replace what goclaw used to register natively. Tools
 that bind to goclaw's live process (conversation/context, cron, Telegram,
 opencode/claude, headless-browser rendering) stay native in goclaw.
 
-- **Transport:** MCP Streamable HTTP (`/mcp`) — works with the llama.cpp web-UI
+## How it fits together
+
+```
+LLM (the model)  ←→  Harness (the agent runtime)  ←─MCP──→  mymcp / myagent
+                      goclaw, Claude Code,                    (tool servers)
+                      OpenCode, llama.cpp UI, …                on loopback
+```
+
+- **LLM** — a text-prediction engine — e.g. GPT-4o/GPT-5 (behind ChatGPT),
+  Claude Sonnet/Opus, Gemini, Llama, Qwen. It has no files, shell, or browser.
+- **Harness** — the program that wraps the LLM and talks to tool servers — e.g.
+  ChatGPT, Codex, Claude Code/Desktop, Cursor, OpenCode, goclaw. It keeps the
+  conversation, sends tool definitions to the model, and dispatches the model's
+  tool calls over MCP. It is the **MCP client**.
+- **MCP** (Model Context Protocol) — the open standard (JSON-RPC over HTTP or
+  stdio) that lets any harness talk to any tool server.
+- **mymcp** — the **MCP server** in this repo: ~79 host tools (files, shell, git,
+  web, memory, …) on `127.0.0.1:9443/mcp`. Compare community MCP servers for GitHub,
+  Slack, Postgres, etc. — same protocol, different tools. See
+  [What is MCP?](docs/WHAT_IS_MCP.md) for the full picture, including **myagent**
+  (agent-to-agent messaging on `:9444`).
+
+## At a glance (this server)
+
+- **Transport:** Streamable HTTP (`/mcp`) — works with the llama.cpp web-UI
   MCP client and other HTTP MCP clients (which can send a custom
   `Authorization` header, so bearer auth "just works" where client certs don't).
+  Most community MCP servers use stdio instead; mymcp uses HTTP so multiple
+  clients can share one instance.
 - **Local by default:** binds `127.0.0.1` and refuses non-loopback binds unless
   you opt in with `--allow-remote`.
-- **Auth:** named **bearer tokens** — one file per name in
-  `~/.config/mymcp/tokens/`. Issue several (one per client/agent), **revoke** by
-  deleting the file or `mymcp token revoke <name>`, and every request is
-  **logged with the matching token's name**. (`--no-auth` for an open loopback
-  server.)
+- **Auth:** named **bearer tokens** (this server's choice — not part of generic
+  MCP) — one file per name in `~/.config/mymcp/tokens/`. Issue several (one per
+  client/agent), **revoke** by deleting the file or `mymcp token revoke <name>`,
+  and every request is **logged with the matching token's name**. (`--no-auth`
+  for an open loopback server.)
 - **For LAN / remote:** keep mymcp on loopback and front it with
   [`truemtls`](https://github.com/brywil/truemtls), which adds mandatory mutual
   TLS in front of any plain-HTTP backend:
@@ -30,7 +60,8 @@ opencode/claude, headless-browser rendering) stay native in goclaw.
 
 > An allowed caller with `run_command`/write tools effectively has remote code
 > execution — that is the point. The token + loopback bind are the guardrails;
-> add truemtls for anything off-box. See [`DESIGN.md`](DESIGN.md).
+> add truemtls for anything off-box. These are choices this server makes; the
+> MCP spec itself doesn't mandate them. See [`DESIGN.md`](DESIGN.md).
 
 ## Prerequisites: a working Go environment
 
@@ -93,6 +124,11 @@ mymcp token revoke alice  # alice's token stops working immediately
 | `mymcp serve [--addr --workspace --no-auth --allow-remote]` | run the tool server |
 | `mymcp token` | print/create the "default" token |
 | `mymcp token add\|show\|revoke <name>` / `list` | manage named tokens |
+
+## Further reading
+
+- [What is MCP? Where does mymcp fit?](docs/WHAT_IS_MCP.md) — LLMs, harnesses, MCP, and where mymcp/myagent sit.
+- [DESIGN.md](DESIGN.md) — scope, transport, auth, and package layout.
 
 ## License
 
