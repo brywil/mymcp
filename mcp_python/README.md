@@ -74,8 +74,6 @@ uv run python mcp_python/server.py --addr 127.0.0.1:9444 --no-auth &
 | `web_fetch` | 288 ms | — |
 | 20× concurrent `shell` | 33.5 ms (597 req/s) | ~79 ms (253 req/s) |
 
-Go's win is dispatch + memory: ~15 MB RSS vs ~80 MB for Python, ~8 MB static binary, no GC pauses.
-
 Run it yourself:
 
 ```bash
