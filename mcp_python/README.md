@@ -62,6 +62,30 @@ uv run python mcp_python/server.py --addr 127.0.0.1:9444 &
 ./run_bench.sh --port 9444 mytask-py /path/to/model.gguf
 ```
 
+### Micro-bench (tool dispatch, no LLM — `mcp_python/bench.py`)
+
+Direct MCP overhead on this box (GB10, `httpx` client, 12–15 calls/tool, `mcp_python` on `:9446 --no-auth`):
+
+| tool | Go p50 | Python p50 | Python/Go |
+|---|---:|---:|---:|
+| `tools/list` (77 vs 66 tools) | 31.1 ms | 6.4 ms | 0.2× |
+| `read_file` | 12.7 ms | 3.6 ms | 0.3× |
+| `shell` (`echo hello`) | 12.3 ms | 4.4 ms | 0.4× |
+| `list_directory` | 12.9 ms | 5.5 ms | 0.4× |
+| `grep` | 1071 ms | 7.0 ms | 0.01× |
+| `web_fetch` (example.com) | 277.8 ms | 129.2 ms | 0.5× |
+| 20× concurrent `shell` | 239 ms (83.7 req/s) | 78.9 ms (253.4 req/s) | 0.3× |
+
+* `grep` delta is mostly workload (Go's `ripgrep` path searches more); others are apples-to-apples.
+* Python's FastMCP path is **faster on micro-bench** here — Starlette/Uvicorn vs `net/http` is not the bottleneck; both are dominated by the tool's own I/O. The Go win shows up in steady-state memory (RSS ~15 MB vs ~80 MB) and in cold-start/binary size, not in per-call latency.
+
+Run it yourself:
+
+```bash
+uv run python mcp_python/bench.py --n 15                  # auto-starts Python on :9446
+uv run python mcp_python/bench.py --n 15 --json-out bench.json  # + JSON
+```
+
 ## Notes
 
 - Tool errors are returned as descriptive strings (e.g. `"old_string not found in ..."`) — matching the Go `Handler` convention, not MCP `isError` envelopes. This is intentional for harness parity.
