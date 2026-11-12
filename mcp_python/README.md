@@ -50,16 +50,17 @@ The Go server is the production path; this mirror is for comparison and for call
 
 ## Benchmarking
 
-Run the same harness against each, same label prefix, and compare `wall_s` + `tokens_out` in `benchmarks/`:
+> `quantkit/bench/run_bench.sh` **does not use mymcp** — it drives OpenCode against `llama-server` directly (different harness). To compare the two tool servers, use **goclaw** as the harness (it mounts `mymcp` over MCP) or the micro-bench below.
+
+**goclaw path** (apples-to-apples agentic run, same LLM + task set, different tool server):
 
 ```bash
-# Go
+# Go (production)
 mymcp serve --addr 127.0.0.1:9443 &
-./run_bench.sh mytask-go /path/to/model.gguf
 
-# Python (different port to avoid collision)
-uv run python mcp_python/server.py --addr 127.0.0.1:9444 &
-./run_bench.sh --port 9444 mytask-py /path/to/model.gguf
+# Python mirror — different port to avoid collision
+uv run python mcp_python/server.py --addr 127.0.0.1:9444 --no-auth &
+# Point goclaw at :9444 for the Python arm, :9443 for the Go arm — same model, same task set
 ```
 
 ### Micro-bench (tool dispatch, no LLM — `mcp_python/bench.py`)
