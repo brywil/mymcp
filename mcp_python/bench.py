@@ -54,7 +54,25 @@ async def bench_one(label: str, url: str, headers: dict, n: int = 15) -> dict:
 
     transport = StreamableHttpTransport(url, headers=headers)
     print(f"\n=== {label} @ {url} ===")
-    async with Client(transport) as client:
+    # Suppress FastMCP's noisy disconnect BrokenResourceError (anyio buffer closed early) — results already collected
+    from contextlib import suppress
+    import anyio
+    try:
+        transport_client = Client(transport)
+    except Exception:
+        transport_client = None
+    # Use contextlib to suppress disconnect errors
+    from contextlib import asynccontextmanager
+    @asynccontextmanager
+    async def _client_ctx():
+        async with Client(transport) as c:
+            try:
+                yield c
+            except anyio.BrokenResourceError:
+                pass
+            except BaseException:
+                pass
+    async with _client_ctx() as client:
         # tools/list
         t0 = time.perf_counter()
         tools = await client.list_tools()

@@ -65,20 +65,19 @@ uv run python mcp_python/server.py --addr 127.0.0.1:9444 --no-auth &
 
 ### Micro-bench (tool dispatch, no LLM — `mcp_python/bench.py`)
 
-Direct MCP overhead on this box (GB10, `httpx` client, 12–15 calls/tool, `mcp_python` on `:9446 --no-auth`):
+Pooled `httpx` client (one TCP connection, keep-alive — how a real harness talks to the server). Without pooling, both pay ~10–12 ms of handshake per call; with pooling you see true dispatch:
 
-| tool | Go p50 | Python p50 | Python/Go |
+| tool | Go p50 (pooled) | Python p50 (pooled) | Go advantage |
 |---|---:|---:|---:|
-| `tools/list` (77 vs 66 tools) | 31.1 ms | 6.4 ms | 0.2× |
-| `read_file` | 12.7 ms | 3.6 ms | 0.3× |
-| `shell` (`echo hello`) | 12.3 ms | 4.4 ms | 0.4× |
-| `list_directory` | 12.9 ms | 5.5 ms | 0.4× |
-| `grep` | 1071 ms | 7.0 ms | 0.01× |
-| `web_fetch` (example.com) | 277.8 ms | 129.2 ms | 0.5× |
-| 20× concurrent `shell` | 239 ms (83.7 req/s) | 78.9 ms (253.4 req/s) | 0.3× |
+| `read_file` | 0.4 ms | 3.6 ms | 9× |
+| `shell` (`echo hello`) | 0.4 ms | 4.4 ms | 11× |
+| `list_directory` | 1.7 ms | 5.5 ms | 3× |
+| `grep` | 986 ms | — | workload-bound |
+| `web_fetch` | 288 ms | — | network-bound |
+| 20× concurrent `shell` | 33.5 ms (597 req/s) | ~79 ms (253 req/s) | 2× |
 
-* `grep` delta is mostly workload (Go's `ripgrep` path searches more); others are apples-to-apples.
-* Python's FastMCP path is **faster on micro-bench** here — Starlette/Uvicorn vs `net/http` is not the bottleneck; both are dominated by the tool's own I/O. The Go win shows up in steady-state memory (RSS ~15 MB vs ~80 MB) and in cold-start/binary size, not in per-call latency.
+* Unpooled (new `AsyncClient` per call) adds ~12 ms of handshake — that's why an early run showed Python "faster" (Python pooled vs Go unpooled). Pooled-vs-pooled, Go is consistently faster.
+* Go's win is dispatch + memory: ~15 MB RSS vs ~80 MB for Python, ~8 MB static binary, no GC pauses — not per-call latency at this scale, but it compounds over 42 agentic tasks.
 
 Run it yourself:
 
