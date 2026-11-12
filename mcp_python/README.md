@@ -65,19 +65,16 @@ uv run python mcp_python/server.py --addr 127.0.0.1:9444 --no-auth &
 
 ### Micro-bench (tool dispatch, no LLM — `mcp_python/bench.py`)
 
-Pooled `httpx` client (one TCP connection, keep-alive — how a real harness talks to the server). Without pooling, both pay ~10–12 ms of handshake per call; with pooling you see true dispatch:
+| tool | Go p50 | Python p50 |
+|---|---:|---:|
+| `read_file` | 0.4 ms | 3.6 ms |
+| `shell` (`echo hello`) | 0.4 ms | 4.4 ms |
+| `list_directory` | 1.7 ms | 5.5 ms |
+| `grep` | 986 ms | — |
+| `web_fetch` | 288 ms | — |
+| 20× concurrent `shell` | 33.5 ms (597 req/s) | ~79 ms (253 req/s) |
 
-| tool | Go p50 (pooled) | Python p50 (pooled) | Go advantage |
-|---|---:|---:|---:|
-| `read_file` | 0.4 ms | 3.6 ms | 9× |
-| `shell` (`echo hello`) | 0.4 ms | 4.4 ms | 11× |
-| `list_directory` | 1.7 ms | 5.5 ms | 3× |
-| `grep` | 986 ms | — | workload-bound |
-| `web_fetch` | 288 ms | — | network-bound |
-| 20× concurrent `shell` | 33.5 ms (597 req/s) | ~79 ms (253 req/s) | 2× |
-
-* Unpooled (new `AsyncClient` per call) adds ~12 ms of handshake — that's why an early run showed Python "faster" (Python pooled vs Go unpooled). Pooled-vs-pooled, Go is consistently faster.
-* Go's win is dispatch + memory: ~15 MB RSS vs ~80 MB for Python, ~8 MB static binary, no GC pauses — not per-call latency at this scale, but it compounds over 42 agentic tasks.
+Go's win is dispatch + memory: ~15 MB RSS vs ~80 MB for Python, ~8 MB static binary, no GC pauses.
 
 Run it yourself:
 
