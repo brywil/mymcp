@@ -125,10 +125,17 @@ mymcp token revoke alice  # alice's token stops working immediately
 | `mymcp token` | print/create the "default" token |
 | `mymcp token add\|show\|revoke <name>` / `list` | manage named tokens |
 
+## Python mirror (FastMCP)
+
+`mcp_python/` is a **Python mirror** of this server, built with [FastMCP](https://github.com/jlowin/fastmcp) for comparison. Same tool catalog (~81 tools), same Streamable HTTP transport (`/mcp` on `127.0.0.1:9443`), same named bearer-token auth (`~/.config/mymcp/tokens/*`) — so any MCP client can point at either binary with the same `Authorization: Bearer <token>`.
+
+The Go server (`build/mymcp`, single binary, `x/net/html` only) remains the production path; the FastMCP mirror (`mcp_python/server.py` + `mcp_python/tools/*.py`) exists to benchmark Python/FastMCP overhead against the Go implementation on the same harness. See [`mcp_python/README.md`](mcp_python/README.md) for run instructions and a side-by-side comparison.
+
 ## Further reading
 
 - [What is MCP? Where does mymcp fit?](docs/WHAT_IS_MCP.md) — LLMs, harnesses, MCP, and where mymcp/myagent sit.
 - [DESIGN.md](DESIGN.md) — scope, transport, auth, and package layout.
+- [mcp_python/README.md](mcp_python/README.md) — Python mirror details and benchmarking.
 
 ## License
 

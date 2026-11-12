@@ -1,0 +1,5 @@
+fastmcp>=4.1
+pydantic>=2
+httpx
+beautifulsoup4
+lxml

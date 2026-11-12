@@ -1,16 +1,17 @@
-# build artifacts (anchored to repo root so it never matches cmd/mymcp/)
+
 /build/
-/mymcp
-*.test
-coverage.out
+# build artifacts (anchored to repo root so it never matches cmd/mymcp/)
 coverage.html
-
-# local certs / keys / trust material — never commit
-*.pem
-*.key
+coverage.out
 *.crt
-*.p12
-
-# editor / OS
 .DS_Store
+# editor / OS
+*.key
+# local certs / keys / trust material — never commit
+mcp_python/__pycache__/
+/mymcp
+*.p12
+*.pem
+__pycache__/
 *.swp
+*.test
